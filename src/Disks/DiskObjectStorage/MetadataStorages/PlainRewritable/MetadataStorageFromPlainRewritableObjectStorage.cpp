@@ -13,6 +13,7 @@
 #include <vector>
 #include <IO/ReadHelpers.h>
 #include <IO/S3Common.h>
+#include <IO/AzureBlobStorage/isRetryableAzureException.h>
 #include <IO/SharedThreadPools.h>
 #include <Poco/Timestamp.h>
 #include <Common/CurrentMetrics.h>
@@ -221,7 +222,7 @@ void MetadataStorageFromPlainRewritableObjectStorage::load(bool is_initial_load,
                 {
                     if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
                         return;
-                    throw;
+                    rethrowAzureException(e, object_path);
                 }
 #endif
                 catch (...)

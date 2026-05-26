@@ -14,6 +14,7 @@
 #include <IO/WriteBufferFromVector.h>
 #include <Disks/IO/ReadBufferFromAzureBlobStorage.h>
 #include <Disks/IO/WriteBufferFromAzureBlobStorage.h>
+#include <IO/AzureBlobStorage/isRetryableAzureException.h>
 #include <Common/getRandomASCIIString.h>
 
 
@@ -210,7 +211,7 @@ namespace
                         watch.elapsedMicroseconds(),
                         error_code,
                         error_message);
-                throw;
+                rethrowAzureException(e, dest_blob);
             }
         }
 
@@ -242,7 +243,7 @@ namespace
                         watch.elapsedMicroseconds(),
                         error_code,
                         error_message);
-                throw;
+                rethrowAzureException(e, dest_blob);
             }
             auto elapsed = watch.elapsedMicroseconds();
 
@@ -405,7 +406,7 @@ namespace
                         watch.elapsedMicroseconds(),
                         error_code,
                         error_message);
-                throw;
+                rethrowAzureException(e, dest_blob);
             }
             auto elapsed = watch.elapsedMicroseconds();
 
@@ -560,7 +561,7 @@ void copyAzureBlobStorageFile(
                           e.what(), src_container_for_logging, src_blob, dest_container_for_logging, dest_blob);
             }
             else
-                throw;
+                rethrowAzureException(e, dest_blob);
         }
     }
     if (!is_native_copy_done)

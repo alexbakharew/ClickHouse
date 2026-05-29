@@ -1,16 +1,20 @@
 #include <Processors/QueryPlan/Optimizations/considerEnablingParallelReplicas.h>
 
+#include <Interpreters/IJoin.h>
 #include <Interpreters/PreparedSets.h>
+#include <Interpreters/TableJoin.h>
+#include <Processors/QueryPlan/BuildRuntimeFilterStep.h>
 #include <Processors/QueryPlan/CreatingSetsStep.h>
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/FilterStep.h>
 #include <Processors/QueryPlan/JoinLazyColumnsStep.h>
-#include <Processors/QueryPlan/ReadFromMergeTree.h>
-#include <Processors/QueryPlan/ReadFromRemote.h>
-#include <Processors/QueryPlan/UnionStep.h>
+#include <Processors/QueryPlan/JoinStep.h>
 #include <Processors/QueryPlan/Optimizations/Optimizations.h>
 #include <Processors/QueryPlan/Optimizations/RuntimeDataflowStatistics.h>
 #include <Processors/QueryPlan/Optimizations/Utils.h>
+#include <Processors/QueryPlan/ReadFromMergeTree.h>
+#include <Processors/QueryPlan/ReadFromRemote.h>
+#include <Processors/QueryPlan/UnionStep.h>
 #include <Common/Exception.h>
 #include <Common/Logger.h>
 #include <Common/logger_useful.h>
@@ -126,34 +130,49 @@ std::pair<const QueryPlan::Node *, size_t> findCorrespondingNodeInSingleNodePlan
     QueryPlan::Node & single_replica_plan_root)
 {
     auto pr_node_hashes = calculateHashTableCacheKeys(parallel_replicas_plan_root);
-    if (auto it = pr_node_hashes.find(&final_node_in_replica_plan); it != pr_node_hashes.end())
+    auto it = pr_node_hashes.find(&final_node_in_replica_plan);
+    if (it == pr_node_hashes.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot find replicas_plan_top_node in hash table");
+
+    auto nopr_node_hashes = calculateHashTableCacheKeys(single_replica_plan_root);
+
+    /// Transparent steps (`ExpressionStep` via `preserves_number_of_rows`, runtime-filter
+    /// `FilterStep`, `BuildRuntimeFilterStep`) inherit their child's cache key, so several nodes on
+    /// one subtree can share the same hash. When that happens we want the match that points at the
+    /// step that actually collects statistics — the one with the same kind as the top-of-replicas
+    /// node in the PR plan. Fall back to any hash-matching node only if no same-kind match exists.
+    const auto & target_name = final_node_in_replica_plan.step->getName();
+    const QueryPlan::Node * matching = nullptr;
+    for (const auto & [nopr_node, nopr_hash] : nopr_node_hashes)
     {
-        auto nopr_node_hashes = calculateHashTableCacheKeys(single_replica_plan_root);
-
-        for (const auto & [nopr_node, nopr_hash] : nopr_node_hashes)
+        if (nopr_hash != it->second)
+            continue;
+        if (nopr_node->step->getName() == target_name)
         {
-            if (nopr_hash == it->second)
-            {
-                if (!nopr_node->step->supportsDataflowStatisticsCollection())
-                {
-                    LOG_DEBUG(
-                        getLogger("optimizeTree"),
-                        "Step ({}) doesn't support dataflow statistics collection. Skipping statistics collection",
-                        nopr_node->step->getName());
-                    return std::make_pair(nullptr, 0);
-                }
-
-                LOG_DEBUG(getLogger("optimizeTree"), "Found matching node in original plan: {}", nopr_node->step->getName());
-                return std::make_pair(nopr_node, nopr_hash);
-            }
+            matching = nopr_node;
+            break;
         }
+        if (!matching)
+            matching = nopr_node;
+    }
+
+    if (!matching)
+    {
         LOG_DEBUG(getLogger("optimizeTree"), "Cannot find step with matching hash in single-node plan");
         return std::make_pair(nullptr, 0);
     }
-    else
+
+    if (!matching->step->supportsDataflowStatisticsCollection())
     {
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot find replicas_plan_top_node in hash table");
+        LOG_DEBUG(
+            getLogger("optimizeTree"),
+            "Step ({}) doesn't support dataflow statistics collection. Skipping statistics collection",
+            matching->step->getName());
+        return std::make_pair(nullptr, 0);
     }
+
+    LOG_DEBUG(getLogger("optimizeTree"), "Found matching node in original plan: {}", matching->step->getName());
+    return std::make_pair(matching, it->second);
 }
 
 ReadFromMergeTree * findReadingStep(const QueryPlan::Node & top_of_single_replica_plan)
@@ -163,6 +182,20 @@ ReadFromMergeTree * findReadingStep(const QueryPlan::Node & top_of_single_replic
     {
         // TODO(nickitat): support multiple read steps with parallel replicas
         const auto * lazy_joining = typeid_cast<const JoinLazyColumnsStep *>(reading_step->step.get());
+        const auto * join = typeid_cast<const JoinStep *>(reading_step->step.get());
+
+        if (join)
+        {
+            /// For a `JoinStep` executed under `parallel_replicas_prefer_local_join`, only one side is
+            /// parallelized across replicas; the other side is read in full by every replica. Pick the
+            /// parallelized side here — the same convention used by `ParallelReplicasLocalPlan::findReadingStep`
+            /// when wiring the coordinator to a single `ReadFromMergeTree`.
+            if (reading_step->children.size() != 2)
+                return nullptr;
+            const auto kind = join->getJoin()->getTableJoin().kind();
+            reading_step = reading_step->children.at(kind == JoinKind::Right ? 1 : 0);
+            continue;
+        }
 
         if (!lazy_joining && reading_step->children.size() > 1)
             return nullptr;
@@ -228,6 +261,12 @@ void moveSetsFromLocalPlanToReplicasPlan(const QueryPlan & single_replica_plan, 
             }
         });
 }
+
+template <typename... Ts>
+constexpr bool isOneOf(const auto * ptr)
+{
+    return (typeid_cast<const Ts *>(ptr) || ...);
+}
 }
 
 namespace QueryPlanOptimizations
@@ -246,8 +285,10 @@ void considerEnablingParallelReplicas(
     Stack stack;
     // Technically, it isn't required for all steps to support dataflow statistics collection,
     // but only for those that we will actually instrument (see `setRuntimeDataflowStatisticsCacheUpdater` calls below).
-    // However, currently only relatively simple plans are supported (no JOINs, CreatingSets from subqueries, UNIONs, etc.),
-    // since all these steps obviously don't support statistics collection, `supportsDataflowStatisticsCollection` is handy to check if the plan is simple enough.
+    // However, currently only relatively simple plans are supported (no UNIONs, etc.),
+    // since such steps obviously don't support statistics collection, `supportsDataflowStatisticsCollection` is handy to check if the plan is simple enough.
+    // `JoinStep`, `BuildRuntimeFilterStep`, and `*CreatingSetsStep` don't collect statistics themselves but always appear below the instrumented top node,
+    // so they are allowed to pass through the check.
     bool plan_is_simple_enough = true;
     traverseQueryPlan(
         stack,
@@ -255,8 +296,7 @@ void considerEnablingParallelReplicas(
         [&](auto & frame_node)
         {
             plan_is_simple_enough &= frame_node.step->supportsDataflowStatisticsCollection()
-                || typeid_cast<const DelayedCreatingSetsStep *>(frame_node.step.get())
-                || typeid_cast<const CreatingSetsStep *>(frame_node.step.get());
+                || isOneOf<JoinStep, BuildRuntimeFilterStep, DelayedCreatingSetsStep, CreatingSetsStep>(frame_node.step.get());
         });
     if (!plan_is_simple_enough)
     {

@@ -3,9 +3,13 @@
 
 #include <Core/Joins.h>
 #include <IO/WriteHelpers.h>
+#include <Interpreters/ActionsDAG.h>
+#include <Interpreters/IJoin.h>
 #include <Interpreters/SetSerialization.h>
 #include <Interpreters/TableJoin.h>
+#include <Processors/QueryPlan/FilterStep.h>
 #include <Processors/QueryPlan/ITransformingStep.h>
+#include <Processors/QueryPlan/JoinStep.h>
 #include <Processors/QueryPlan/JoinStepLogical.h>
 #include <Processors/QueryPlan/ReadFromRemote.h>
 #include <Processors/QueryPlan/Serialization.h>
@@ -49,21 +53,34 @@ UInt64 calculateHashFromStep(const ITransformingStep & transform)
 {
     // The purpose of `HashTablesStatistics` is to provide cardinality estimations.
     // Steps that preserve the number of input rows do not affect cardinality, so we can skip them.
-    if (!transform.getTransformTraits().preserves_number_of_rows)
+    if (transform.getTransformTraits().preserves_number_of_rows)
+        return 0;
+
+    /// Hash a `FilterStep` via its expression DAG rather than `serialize()`: the DAG may carry a
+    /// `ColumnRuntimeFilter` (the `__applyFilter` handle), which `updateHash` handles by hashing the
+    /// handle's deterministic structural id (`ColumnRuntimeFilter::updateHashWithValue`), whereas
+    /// generic constant serialization doesn't know that dummy type. Because the handle id is
+    /// deterministic, the two Auto-PR plan builds hash equally with no runtime-filter special-casing.
+    if (const auto * filter = typeid_cast<const FilterStep *>(&transform))
     {
-        WriteBufferFromOwnString wbuf;
-        SerializedSetsRegistry registry;
-        IQueryPlanStep::Serialization ctx{.out = wbuf, .registry = registry, .skip_final_flag = true, .skip_cache_key = true};
-
-        writeStringBinary(transform.getSerializationName(), wbuf);
-        if (transform.isSerializable())
-            transform.serialize(ctx);
-
         SipHash hash;
-        hash.update(wbuf.str());
+        hash.update(filter->getSerializationName());
+        filter->getExpression().updateHash(hash);
+        hash.update(filter->getFilterColumnName());
         return hash.get64();
     }
-    return 0;
+
+    WriteBufferFromOwnString wbuf;
+    SerializedSetsRegistry registry;
+    IQueryPlanStep::Serialization ctx{.out = wbuf, .registry = registry, .skip_final_flag = true, .skip_cache_key = true};
+
+    writeStringBinary(transform.getSerializationName(), wbuf);
+    if (transform.isSerializable())
+        transform.serialize(ctx);
+
+    SipHash hash;
+    hash.update(wbuf.str());
+    return hash.get64();
 }
 
 }
@@ -171,8 +188,38 @@ void calculateHashTableCacheKeys(
             continue;
         }
 
-        for (const auto * child : node.children)
-            frame.hash.update(cache_keys[child]);
+        /// Canonicalize `JoinStep` children order so DP-driven side swaps don't cause the subtree
+        /// hash to diverge between the single-replica and parallel-replicas plan builds in
+        /// `considerEnablingParallelReplicas`. For commutative kinds (`INNER`/`FULL`/`CROSS`/`Comma`)
+        /// sort children by their cache key. For `RIGHT` rely on the equivalence
+        /// `A RIGHT JOIN B ≡ B LEFT JOIN A`: swap the children and also remap the kind to `LEFT`,
+        /// so two structurally equivalent subtrees hash identically. Other kinds keep their
+        /// existing order. The (canonicalized) kind itself is mixed into the hash so that
+        /// otherwise identical subtrees with different kinds (`INNER` vs `LEFT`) do not collide.
+        if (const auto * join_step = dynamic_cast<const JoinStep *>(node.step.get()); join_step && node.children.size() == 2)
+        {
+            auto kind = join_step->getJoin()->getTableJoin().kind();
+            auto a = cache_keys[node.children.at(0)];
+            auto b = cache_keys[node.children.at(1)];
+            if (isInner(kind) || isFull(kind) || isCrossOrComma(kind))
+            {
+                if (a > b)
+                    std::swap(a, b);
+            }
+            else if (isRight(kind))
+            {
+                std::swap(a, b);
+                kind = JoinKind::Left;
+            }
+            frame.hash.update(static_cast<uint8_t>(kind));
+            frame.hash.update(a);
+            frame.hash.update(b);
+        }
+        else
+        {
+            for (const auto * child : node.children)
+                frame.hash.update(cache_keys[child]);
+        }
 
         if (const auto * source = dynamic_cast<const ReadFromParallelRemoteReplicasStep *>(node.step.get()))
             frame.hash.update(calculateHashFromStep(*source));
@@ -186,6 +233,17 @@ void calculateHashTableCacheKeys(
         const auto raw = frame.hash.get64();
         raw_hashes[&node] = raw;
         cache_keys[&node] = raw;
+
+        /// Make row-preserving transforms fully transparent: take the cache key straight from the
+        /// child. Such steps (e.g. `ExpressionStep`, `BuildRuntimeFilterStep`) carry no
+        /// cardinality-relevant information, so two subtrees that differ only by added/removed
+        /// row-preserving steps between the two Auto-PR plan builds hash to the same key.
+        if (const auto * transform = dynamic_cast<const ITransformingStep *>(node.step.get()))
+        {
+            chassert(node.children.size() == 1);
+            if (transform->getTransformTraits().preserves_number_of_rows)
+                cache_keys[&node] = cache_keys[node.children.front()];
+        }
 
         stack.pop_back();
     }

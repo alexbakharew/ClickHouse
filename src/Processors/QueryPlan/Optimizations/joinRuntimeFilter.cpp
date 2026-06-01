@@ -233,10 +233,7 @@ bool tryAddJoinRuntimeFilter(QueryPlan::Node & node, QueryPlan::Nodes & nodes, c
 
     /// Deterministic structural fingerprint of this join's runtime filters. Unlike a random name,
     /// it is identical across the two Auto-PR plan builds (single-replica and parallel-replicas), so
-    /// their plans hash equally with no special-casing. Re-execution safety does NOT rely on the
-    /// name being unique: each plan build creates its own `FutureRuntimeFilter` handle(s) and the
-    /// rendezvous is the handle pointer carried in the plan, so recursive-CTE iterations and MV
-    /// blocks each get a fresh filter regardless of the (stable) fingerprint. See `FutureRuntimeFilter`.
+    /// their plans hash equally with no special-casing.
     SipHash fingerprint_hash;
     fingerprint_hash.update(join_step->getSerializationName());
     fingerprint_hash.update(static_cast<uint8_t>(join_operator.kind));

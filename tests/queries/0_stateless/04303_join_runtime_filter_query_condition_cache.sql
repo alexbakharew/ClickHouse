@@ -24,7 +24,8 @@ SET use_query_condition_cache = 1;
 DROP TABLE IF EXISTS rf_qcc_probe;
 DROP TABLE IF EXISTS rf_qcc_build;
 
--- Probe (left) table: one row per granule, so each key lives in a distinct granule.
+-- Probe (left) table: a small granule (4 rows) over keys 0..39, ordered by the key, so the three
+-- probe keys used below (2, 21, 37) fall into three different granules (the 1st, 6th and 10th).
 CREATE TABLE rf_qcc_probe (p_key Int32, payload Int32) ENGINE = MergeTree ORDER BY payload
     SETTINGS index_granularity = 4;
 INSERT INTO rf_qcc_probe SELECT number, number FROM numbers(40);

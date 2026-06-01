@@ -8,6 +8,7 @@
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesBinaryEncoding.h>
 #include <Columns/ColumnConst.h>
+#include <Columns/ColumnRuntimeFilter.h>
 #include <Columns/ColumnSet.h>
 #include <Columns/validateColumnType.h>
 #include <Functions/IFunction.h>
@@ -3702,6 +3703,15 @@ static void serializeConstant(const IDataType & type, const IColumn & value, Wri
         return;
     }
 
+    if (WhichDataType(type).isRuntimeFilter())
+    {
+        /// The plan-carried runtime-filter handle is a local pointer that cannot cross the
+        /// serialization boundary, so we drop it (nothing to write). On the receiving side the
+        /// handle deserializes as null and `__applyFilter` lets all rows pass — the filter is
+        /// simply not applied there. This mirrors how `BuildRuntimeFilterStep` drops its handle.
+        return;
+    }
+
     if (WhichDataType(type).isFunction())
     {
         const IColumn * maybe_function = &value;
@@ -3767,6 +3777,13 @@ static MutableColumnPtr deserializeConstant(
         auto column_const = ColumnConst::create(std::move(column_set), 0);
         registry.sets[hash].push_back(set_ptr);
         return column_const;
+    }
+
+    if (WhichDataType(type).isRuntimeFilter())
+    {
+        /// The handle was dropped on serialization (see serializeConstant). Recreate the dummy
+        /// const column with a null handle; `__applyFilter` treats a null handle as "all rows pass".
+        return ColumnConst::create(ColumnRuntimeFilter::create(1, nullptr), 0);
     }
 
     if (WhichDataType(type).isFunction())

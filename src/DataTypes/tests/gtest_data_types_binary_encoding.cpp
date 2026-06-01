@@ -9,6 +9,7 @@
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/DataTypeSet.h>
+#include <DataTypes/DataTypeRuntimeFilter.h>
 #include <DataTypes/DataTypeInterval.h>
 #include <DataTypes/DataTypeIPv4andIPv6.h>
 #include <DataTypes/DataTypeAggregateFunction.h>
@@ -84,6 +85,7 @@ GTEST_TEST(DataTypesBinaryEncoding, EncodeAndDecode)
     check(DataTypeFactory::instance().get("Tuple(c1 UInt32, c2 String, c3 UUID)"));
     check(DataTypeFactory::instance().get("Tuple(c1 UInt32, c2 String, c3 Tuple(c4 UUID, c5 Date, c6 IPv4))"));
     check(std::make_shared<DataTypeSet>());
+    check(std::make_shared<DataTypeRuntimeFilter>());
     check(std::make_shared<DataTypeInterval>(IntervalKind::Kind::Nanosecond));
     check(std::make_shared<DataTypeInterval>(IntervalKind::Kind::Microsecond));
     check(DataTypeFactory::instance().get("Nullable(UInt32)"));

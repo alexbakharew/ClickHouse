@@ -15,6 +15,7 @@
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/DataTypeSet.h>
+#include <DataTypes/DataTypeRuntimeFilter.h>
 #include <DataTypes/DataTypeInterval.h>
 #include <DataTypes/DataTypeIPv4andIPv6.h>
 #include <DataTypes/DataTypeAggregateFunction.h>
@@ -201,8 +202,10 @@ BinaryTypeIndex getBinaryTypeIndex(const DataTypePtr & type)
         case TypeIndex::JSONPaths:
             throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Binary encoding of type JSONPaths is not supported");
         /// RuntimeFilter is an intermediate dummy used only inside the __applyFilter expression.
+        /// It carries no parameters; the plan-built handle it points to is dropped on serialization
+        /// (see serializeConstant in ActionsDAG.cpp), mirroring how BuildRuntimeFilterStep drops it.
         case TypeIndex::RuntimeFilter:
-            throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Binary encoding of type RuntimeFilter is not supported");
+            return BinaryTypeIndex::RuntimeFilter;
         case TypeIndex::Object:
         {
             const auto & object_type = assert_cast<const DataTypeObject &>(*type);
@@ -693,6 +696,8 @@ static DataTypePtr decodeDataType(ReadBuffer & buf, size_t & complexity)
         }
         case BinaryTypeIndex::Set:
             return std::make_shared<DataTypeSet>();
+        case BinaryTypeIndex::RuntimeFilter:
+            return std::make_shared<DataTypeRuntimeFilter>();
         case BinaryTypeIndex::Interval:
         {
             UInt8 kind = 0;

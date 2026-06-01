@@ -440,6 +440,7 @@ struct WhichDataType
     constexpr bool isQBit() const { return idx == TypeIndex::QBit; }
     constexpr bool isMap() const {return idx == TypeIndex::Map; }
     constexpr bool isSet() const { return idx == TypeIndex::Set; }
+    constexpr bool isRuntimeFilter() const { return idx == TypeIndex::RuntimeFilter; }
     constexpr bool isInterval() const { return idx == TypeIndex::Interval; }
 
     constexpr bool isNothing() const { return idx == TypeIndex::Nothing; }

@@ -14,6 +14,7 @@
 #include <Poco/Util/AbstractConfiguration.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Interpreters/Context_fwd.h>
+#include <Common/BlobStorageLogWriter.h>
 
 namespace DB
 {
@@ -116,10 +117,30 @@ using DeleteBlobResultDeferredResponse = Azure::Storage::DeferredResponse<Azure:
 
 /// A wrapper for ContainerClient that correctly handles the prefix of blobs.
 /// See AzureBlobStorageEndpoint and processAzureBlobStorageEndpoint for details.
+///
+/// This wrapper is the single chokepoint for every Azure SDK call in the
+/// ClickHouse Azure object-storage layer. Callers should NOT acquire raw
+/// `BlobClient`/`BlockBlobClient` objects and operate on them directly —
+/// use the named data-plane methods below (`uploadSinglePartWith…`,
+/// `downloadBlobBodyStream…`, `deleteBlobSingleWith…` etc.).
+///
+/// Common boilerplate (profile-event increments paired with their DiskAzure
+/// counterparts, BlobStorageLog event recording with the Stopwatch +
+/// error_code + error_message triplet) is absorbed into the helper methods
+/// in the "Universal helpers" section, so call sites stay thin.
+///
+/// Retry policy currently lives at the call sites (see
+/// `WriteBufferFromAzureBlobStorage::execWithRetry` and the inline retry
+/// loops in `ReadBufferFromAzureBlobStorage`). Wrapper methods are
+/// non-retrying: they do exactly one SDK call, log success or failure into
+/// BlobStorageLog, and rethrow on failure. T1 (unified retry helper) is a
+/// follow-up that can later absorb the retry into the wrapper itself.
 class ContainerClientWrapper
 {
 public:
     ContainerClientWrapper(RawContainerClient client_, String blob_prefix_);
+
+    /// === existing accessors (kept; some now used only internally) ===
 
     bool IsClientForDisk() const;
     BlobClient GetBlobClient(const String & blob_name) const;
@@ -130,6 +151,179 @@ public:
     BlobContainerBatch CreateBatch() const;
     BlobBatchResultResponse SubmitBatch(const BlobContainerBatch & batch) const;
     String GetBlobPath(const String & blob_name) const;
+
+    /// === Universal tracing helpers (ProfileEvents pairs) ===
+    ///
+    /// Each `traceAzure<Op>` increments the generic `Azure<Op>` event, and
+    /// additionally the `DiskAzure<Op>` counterpart when `IsClientForDisk()`
+    /// returns true. Replaces the copy-pasted pair at every call site.
+
+    void traceAzureListObjects(size_t count = 1) const;
+    void traceAzureGetProperties() const;
+    void traceAzureDeleteObjects(size_t count = 1) const;
+    void traceAzureUpload() const;
+    void traceAzureStageBlock() const;
+    void traceAzureCommitBlockList() const;
+    void traceAzureCopyObject() const;
+    void traceAzureGetObject() const;
+
+    /// === Universal BlobStorageLog helpers ===
+    ///
+    /// These replace the `Stopwatch + error_code + error_message +
+    /// blob_log->addEvent(...)` triplet that was hand-rolled at every SDK
+    /// call site. They are no-ops if `blob_log` is nullptr.
+
+    static void logBlobStorageEventOnSuccess(
+        const BlobStorageLogWriterPtr & blob_log,
+        BlobStorageLogElement::EventType event_type,
+        const String & container_for_logging,
+        const String & blob_path_for_logging,
+        size_t data_size,
+        UInt64 elapsed_microseconds);
+
+    static void logBlobStorageEventOnFailure(
+        const BlobStorageLogWriterPtr & blob_log,
+        BlobStorageLogElement::EventType event_type,
+        const String & container_for_logging,
+        const String & blob_path_for_logging,
+        size_t data_size,
+        UInt64 elapsed_microseconds,
+        Int32 status_code,
+        const String & error_message);
+
+    /// === Data-plane wrappers (excessively named, no overloads) ===
+    ///
+    /// Each method corresponds to exactly one SDK call shape at exactly
+    /// one call site (or a few call sites with identical shape). Variants
+    /// that differ in options/context/logging are separate methods rather
+    /// than parameter-overloaded forms.
+
+    /// containerExists() probe; checks if the container itself exists.
+    BlobContainerPropertiesRespones getContainerPropertiesForExistenceCheck() const;
+
+    /// Paged listing: single SDK call with the blob_prefix prepended and the
+    /// returned blob names stripped of that prefix. Callers iterate pages
+    /// themselves (either via continuation tokens in `AzureIteratorAsync` or
+    /// via `MoveToNextPage()` in `listObjects`) and call
+    /// `traceAzureListObjects()` once per page request to record the event
+    /// — the wrapper does NOT trace internally because each page is its own
+    /// HTTP request and the caller controls when it happens.
+    ListBlobsPagedResponse listBlobsPagedWithPrefixAdjustment(const ListBlobsOptions & options) const;
+
+    /// AzureObjectStorage::exists — NotFound → caller returns false.
+    Azure::Response<Azure::Storage::Blobs::Models::BlobProperties>
+        getBlobPropertiesForExistenceCheck(const String & blob_name) const;
+    /// AzureObjectStorage::getObjectMetadata — full property snapshot.
+    Azure::Response<Azure::Storage::Blobs::Models::BlobProperties>
+        getBlobPropertiesForMetadata(const String & blob_name) const;
+    /// ReadBuffer::tryGetFileSize / getRemoteFileSize — size-only path.
+    Azure::Response<Azure::Storage::Blobs::Models::BlobProperties>
+        getBlobPropertiesForSizeOnly(const String & blob_name) const;
+    /// WriteBuffer::finalizeImpl post-upload check — NotFound means we lost
+    /// the just-uploaded blob, which the caller treats as a bug.
+    Azure::Response<Azure::Storage::Blobs::Models::BlobProperties>
+        getBlobPropertiesForUploadVerification(const String & blob_name) const;
+
+    /// ReadBuffer::initialize TTFB download with retry-attempt context.
+    Azure::Response<Azure::Storage::Blobs::Models::DownloadBlobResult>
+        downloadBlobBodyStreamWithAttemptContext(
+            const String & blob_name,
+            const Azure::Storage::Blobs::DownloadBlobOptions & options,
+            size_t attempt) const;
+    /// ReadBuffer::readBigAt random-access download (no retry attempt key).
+    Azure::Response<Azure::Storage::Blobs::Models::DownloadBlobResult>
+        downloadBlobBodyStreamForReadBigAt(
+            const String & blob_name,
+            const Azure::Storage::Blobs::DownloadBlobOptions & options) const;
+
+    /// WriteBuffer single-part upload path: access conditions, retry-attempt
+    /// SDK context, and BlobStorageLog recording (success and failure).
+    Azure::Response<Azure::Storage::Blobs::Models::UploadBlockBlobResult>
+        uploadSinglePartWithAccessConditionsAndRetryContext(
+            const String & blob_name,
+            Azure::Core::IO::BodyStream & stream,
+            const Azure::Storage::Blobs::UploadBlockBlobOptions & options,
+            size_t attempt,
+            const BlobStorageLogWriterPtr & blob_log,
+            const String & container_for_logging,
+            size_t data_size_for_logging) const;
+    /// copyAzureBlobStorageFile single-part upload path: no options, no retry
+    /// context. Logs only on failure (matches current behaviour: success
+    /// log was missing at this site).
+    void uploadSinglePartForCopyWithBlobStorageLog(
+        const String & blob_name,
+        Azure::Core::IO::BodyStream & stream,
+        const BlobStorageLogWriterPtr & blob_log,
+        const String & container_for_logging,
+        size_t data_size_for_logging) const;
+
+    /// WriteBuffer stage-block path: retry-attempt SDK context + log.
+    void stageBlockWithRetryContextAndBlobStorageLog(
+        const String & blob_name,
+        const String & block_id,
+        Azure::Core::IO::BodyStream & stream,
+        size_t attempt,
+        const BlobStorageLogWriterPtr & blob_log,
+        const String & container_for_logging,
+        size_t data_size_for_logging) const;
+    /// copyAzureBlobStorageFile stage-block path: plain, log only.
+    void stageBlockForCopyWithBlobStorageLog(
+        const String & blob_name,
+        const String & block_id,
+        Azure::Core::IO::BodyStream & stream,
+        const BlobStorageLogWriterPtr & blob_log,
+        const String & container_for_logging,
+        size_t data_size_for_logging) const;
+
+    /// WriteBuffer commit-block-list path: access conditions + retry context.
+    void commitBlockListWithAccessConditionsAndRetryContext(
+        const String & blob_name,
+        const std::vector<std::string> & block_ids,
+        const Azure::Storage::Blobs::CommitBlockListOptions & options,
+        size_t attempt,
+        const BlobStorageLogWriterPtr & blob_log,
+        const String & container_for_logging) const;
+    /// copyAzureBlobStorageFile commit-block-list path: plain, log only.
+    void commitBlockListForCopyWithBlobStorageLog(
+        const String & blob_name,
+        const std::vector<std::string> & block_ids,
+        const BlobStorageLogWriterPtr & blob_log,
+        const String & container_for_logging) const;
+
+    /// AzureObjectStorage::removeObjectImpl single-blob delete with full
+    /// BlobStorageLog accounting (success, NotFound-with-if_exists, failure).
+    /// Returns true if the blob was actually deleted, false if it didn't
+    /// exist and `if_exists` was true.
+    void deleteBlobSingleWithBlobStorageLog(
+        const String & blob_name,
+        bool if_exists,
+        const BlobStorageLogWriterPtr & blob_log,
+        const String & container_for_logging,
+        const String & local_path_for_logging,
+        size_t bytes_size_for_logging) const;
+
+    /// AzureObjectStorage::removeObjectsBatchIfExists: enqueue a delete into
+    /// a batch built by `CreateBatch()`. Prepends the blob_prefix internally
+    /// so callers don't compute it.
+    DeleteBlobResultDeferredResponse addDeleteBlobToBatch(
+        BlobContainerBatch & batch,
+        const String & blob_name) const;
+
+    /// AzureObjectStorage::tagObjects — read-modify-write of blob tags.
+    std::map<std::string, std::string> getBlobTagsForUpdate(const String & blob_name) const;
+    void setBlobTags(const String & blob_name, const std::map<std::string, std::string> & tags) const;
+
+    /// copyAzureBlobStorageFile native-copy path.
+    String getBlobUrlForServerSideCopy(const String & blob_name) const;
+    Azure::Response<Azure::Storage::Blobs::Models::CopyBlobFromUriResult>
+        copyBlobFromUriSync(
+            const String & dest_blob_name,
+            const String & source_uri,
+            const Azure::Storage::Blobs::CopyBlobFromUriOptions & options) const;
+    Azure::Storage::Blobs::StartBlobCopyOperation copyBlobFromUriAsync(
+        const String & dest_blob_name,
+        const String & source_uri,
+        const Azure::Storage::Blobs::StartBlobCopyFromUriOptions & options) const;
 
 private:
     RawContainerClient client;

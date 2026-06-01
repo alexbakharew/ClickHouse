@@ -22,7 +22,6 @@ class ReadBufferFromAzureBlobStorage : public ReadBufferFromFileBase
 {
 public:
     using ContainerClientPtr = std::shared_ptr<const AzureBlobStorage::ContainerClient>;
-    using BlobClientPtr = std::unique_ptr<const AzureBlobStorage::BlobClient>;
 
     ReadBufferFromAzureBlobStorage(
         ContainerClientPtr blob_container_client_,
@@ -69,7 +68,6 @@ private:
 
     std::unique_ptr<Azure::Core::IO::BodyStream> data_stream;
     ContainerClientPtr blob_container_client;
-    BlobClientPtr blob_client;
 
     const String path;
     size_t max_single_read_retries;

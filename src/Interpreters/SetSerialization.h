@@ -1,5 +1,6 @@
 #pragma once
 #include <Interpreters/PreparedSets.h>
+#include <Core/ProtocolDefines.h>
 
 namespace DB
 {
@@ -15,6 +16,8 @@ struct SerializedSetsRegistry
     };
 
     std::unordered_map<FutureSet::Hash, FutureSetPtr, Hashing> sets;
+
+    UInt64 version = DBMS_QUERY_PLAN_SERIALIZATION_VERSION;
 };
 
 class ColumnSet;

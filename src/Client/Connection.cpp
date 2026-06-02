@@ -1060,7 +1060,12 @@ void Connection::sendQueryPlan(const QueryPlan & query_plan)
 {
     writeVarUInt(Protocol::Client::QueryPlan, *out);
 
-    if (query_plan.isSerialized())
+    /// The cached bytes were produced at a fixed version (shared across all replicas). Use them only
+    /// if this peer supports at least that version; otherwise it would reject the plan in
+    /// `QueryPlan::deserialize`. During a rolling upgrade an older peer advertises a lower version, so
+    /// we reserialize on-the-fly at the negotiated version (which downgrades version-gated features
+    /// such as runtime filters).
+    if (query_plan.isSerialized() && server_query_plan_serialization_version >= query_plan.getSerializedVersion())
     {
         // Use cached serialization
         auto serialized_data = query_plan.getSerializedData();

@@ -1,15 +1,16 @@
-#include <Processors/QueryPlan/Serialization.h>
+#include <Processors/QueryPlan/BuildRuntimeFilterStep.h>
+#include <Processors/QueryPlan/CreatingSetsStep.h>
+#include <Processors/QueryPlan/MaterializingCTEStep.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/QueryPlanSerializationSettings.h>
 #include <Processors/QueryPlan/QueryPlanStepRegistry.h>
-#include <Processors/QueryPlan/CreatingSetsStep.h>
-#include <Processors/QueryPlan/MaterializingCTEStep.h>
+#include <Processors/QueryPlan/Serialization.h>
 
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 
-#include <Core/Settings.h>
 #include <Core/ProtocolDefines.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypesBinaryEncoding.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/SetSerialization.h>
@@ -21,9 +22,9 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int NOT_IMPLEMENTED;
-    extern const int INCORRECT_DATA;
-    extern const int LOGICAL_ERROR;
+extern const int NOT_IMPLEMENTED;
+extern const int INCORRECT_DATA;
+extern const int LOGICAL_ERROR;
 }
 
 static void serializeHeader(const Block & header, WriteBuffer & out)
@@ -59,9 +60,11 @@ static Block deserializeHeader(ReadBuffer & in)
     return Block(std::move(columns));
 }
 
-/// Nothing is here for now
 struct QueryPlan::SerializationFlags
 {
+    /// Negotiated serialization version (the common denominator between this server and the peer).
+    /// The plan is serialized using only features available at this version.
+    UInt64 version = DBMS_QUERY_PLAN_SERIALIZATION_VERSION;
 };
 
 void QueryPlan::serialize(WriteBuffer & out, size_t max_supported_version) const
@@ -70,6 +73,7 @@ void QueryPlan::serialize(WriteBuffer & out, size_t max_supported_version) const
     writeVarUInt(version, out);
 
     SerializationFlags flags;
+    flags.version = version;
     serialize(out, flags);
 }
 
@@ -78,6 +82,7 @@ void QueryPlan::serialize(WriteBuffer & out, const SerializationFlags & flags) c
     checkInitialized();
 
     SerializedSetsRegistry registry;
+    registry.version = flags.version;
 
     struct Frame
     {
@@ -92,8 +97,18 @@ void QueryPlan::serialize(WriteBuffer & out, const SerializationFlags & flags) c
         auto & frame = stack.top();
         auto * node = frame.node;
 
-        if (typeid_cast<DelayedCreatingSetsStep *>(node->step.get())
-            || typeid_cast<DelayedMaterializingCTEsStep *>(node->step.get()))
+        if (typeid_cast<DelayedCreatingSetsStep *>(node->step.get()) || typeid_cast<DelayedMaterializingCTEsStep *>(node->step.get()))
+        {
+            frame.node = node->children.front();
+            continue;
+        }
+
+        /// Runtime filters appeared in plan serialization version
+        /// DBMS_QUERY_PLAN_SERIALIZATION_VERSION_RUNTIME_FILTER. For an older peer, drop the build
+        /// side by serializing through it (it is a passthrough that only builds the filter as a side
+        /// effect; the matching `__applyFilter` is folded to a constant in `ActionsDAG::serialize`).
+        if (flags.version < DBMS_QUERY_PLAN_SERIALIZATION_VERSION_RUNTIME_FILTER
+            && typeid_cast<BuildRuntimeFilterStep *>(node->step.get()))
         {
             frame.node = node->children.front();
             continue;
@@ -136,9 +151,10 @@ void QueryPlan::serialize(WriteBuffer & out, const SerializationFlags & flags) c
 void QueryPlan::ensureSerialized(size_t max_supported_version) const
 {
     if (serialized_plan)
-        return;  // Already serialized
+        return; // Already serialized
 
     serialized_plan = std::make_unique<WriteBufferFromOwnString>();
+    serialized_plan_version = std::min<UInt64>(max_supported_version, DBMS_QUERY_PLAN_SERIALIZATION_VERSION);
     serialize(*serialized_plan, max_supported_version);
     serialized_plan->finalize();
 }
@@ -146,10 +162,17 @@ void QueryPlan::ensureSerialized(size_t max_supported_version) const
 std::string_view QueryPlan::getSerializedData() const
 {
     if (!serialized_plan)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Query plan is not serialized. Call ensureSerialized() first.");
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Query plan is not serialized. Call ensureSerialized() first.");
 
     return serialized_plan->stringView();
+}
+
+UInt64 QueryPlan::getSerializedVersion() const
+{
+    if (!serialized_plan)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Query plan is not serialized. Call ensureSerialized() first.");
+
+    return serialized_plan_version;
 }
 
 bool QueryPlan::isSerialized() const
@@ -163,9 +186,11 @@ QueryPlanAndSets QueryPlan::deserialize(ReadBuffer & in, const ContextPtr & cont
     readVarUInt(version, in);
 
     if (version > DBMS_QUERY_PLAN_SERIALIZATION_VERSION)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
             "Query plan serialization version {} is not supported. The last supported version is {}",
-            version, DBMS_QUERY_PLAN_SERIALIZATION_VERSION);
+            version,
+            DBMS_QUERY_PLAN_SERIALIZATION_VERSION);
 
     SerializationFlags flags;
     return deserialize(in, context, flags);
@@ -212,7 +237,7 @@ QueryPlanAndSets QueryPlan::deserialize(ReadBuffer & in, const ContextPtr & cont
         readStringBinary(step_name, in);
         readStringBinary(step_description, in);
 
-        auto output_header  = std::make_shared<const Block>(deserializeHeader(in));
+        auto output_header = std::make_shared<const Block>(deserializeHeader(in));
 
         QueryPlanSerializationSettings settings;
         settings.readBinary(in);
@@ -231,9 +256,11 @@ QueryPlanAndSets QueryPlan::deserialize(ReadBuffer & in, const ContextPtr & cont
                 *step->getOutputHeader(), *output_header, fmt::format("deserialization of query plan {} step", step_name));
         }
         else if (output_header->columns())
-            throw Exception(ErrorCodes::INCORRECT_DATA,
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
                 "Deserialized step {} has no output stream, but deserialized header is not empty : {}",
-                step_name, output_header->dumpStructure());
+                step_name,
+                output_header->dumpStructure());
 
         auto & node = plan.nodes.emplace_back(std::move(step), std::move(frame.children));
         frame.to_fill = &node;

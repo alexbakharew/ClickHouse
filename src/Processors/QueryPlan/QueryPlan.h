@@ -113,6 +113,10 @@ public:
     /// Get cached serialized data
     std::string_view getSerializedData() const;
 
+    /// The serialization version the cached data was produced at (see `ensureSerialized`). A peer can
+    /// only consume the cached bytes if it supports at least this version.
+    UInt64 getSerializedVersion() const;
+
     /// Check if already serialized
     bool isSerialized() const;
 
@@ -214,6 +218,8 @@ private:
     /// Cached serialized representation
     /// FIXME: temporary measure to avoid changing many methods to bypass serialized plan
     mutable std::unique_ptr<WriteBufferFromOwnString> serialized_plan;
+    /// The version the cached `serialized_plan` was produced at (only meaningful when it is set).
+    mutable UInt64 serialized_plan_version = 0;
 };
 
 /// This is a structure which contains a query plan and a list of sets.

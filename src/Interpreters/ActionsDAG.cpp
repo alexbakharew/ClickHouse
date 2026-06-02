@@ -4,6 +4,7 @@
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesBinaryEncoding.h>
@@ -24,6 +25,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/Operators.h>
 #include <Core/SortDescription.h>
+#include <Core/ProtocolDefines.h>
 #include <Planner/PlannerActionsVisitor.h>
 
 #include <algorithm>
@@ -3846,8 +3848,52 @@ static void addChildrenBeforeNode(std::vector<const ActionsDAG::Node *> & reorde
     already_added_nodes.insert(node);
 };
 
+static bool isRuntimeFilterApplication(const ActionsDAG::Node & node)
+{
+    if (node.type != ActionsDAG::ActionType::FUNCTION)
+        return false;
+
+    return std::any_of(
+        node.children.begin(),
+        node.children.end(),
+        [](const ActionsDAG::Node * child) { return child->result_type && child->result_type->getTypeId() == TypeIndex::RuntimeFilter; });
+}
+
+static void replaceRuntimeFilterWithConstant(ActionsDAG::Node & node)
+{
+    node.type = ActionsDAG::ActionType::COLUMN;
+    node.children.clear();
+    node.function = nullptr;
+    node.function_base = nullptr;
+    node.is_function_compiled = false;
+    node.is_deterministic_constant = true;
+    node.result_type = std::make_shared<DataTypeUInt8>();
+    node.column = node.result_type->createColumnConst(1, Field(static_cast<UInt64>(1)));
+}
+
 void ActionsDAG::serialize(WriteBuffer & out, SerializedSetsRegistry & registry) const
 {
+    /// Below DBMS_QUERY_PLAN_SERIALIZATION_VERSION_RUNTIME_FILTER the peer does not know the
+    /// `RuntimeFilter` type, so fold every `__applyFilter` to a constant `true`. This is a faithful
+    /// no-op: the handle is a local pointer that never survives serialization (the matching
+    /// `BuildRuntimeFilterStep` is skipped too), so a runtime filter only ever lets all rows pass on
+    /// the receiving side anyway. The orphaned handle column is then dropped by `removeUnusedActions`.
+    if (registry.version < DBMS_QUERY_PLAN_SERIALIZATION_VERSION_RUNTIME_FILTER
+        && std::any_of(nodes.begin(), nodes.end(), isRuntimeFilterApplication))
+    {
+        ActionsDAG cleaned = clone();
+        for (auto & node : cleaned.nodes)
+        {
+            if (isRuntimeFilterApplication(node))
+                replaceRuntimeFilterWithConstant(node);
+        }
+        /// Drops the now-orphaned handle (and key) nodes. Keep inputs so the step's input header is
+        /// preserved, and skip constant folding to leave the rest of the DAG untouched.
+        cleaned.removeUnusedActions(/*allow_remove_inputs=*/false, /*allow_constant_folding=*/false);
+        cleaned.serialize(out, registry);
+        return;
+    }
+
     size_t nodes_size = nodes.size();
     writeVarUInt(nodes_size, out);
 

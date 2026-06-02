@@ -4,6 +4,7 @@
 #include <Core/Joins.h>
 #include <IO/WriteHelpers.h>
 #include <Interpreters/ActionsDAG.h>
+#include <Interpreters/ExpressionActions.h>
 #include <Interpreters/IJoin.h>
 #include <Interpreters/SetSerialization.h>
 #include <Interpreters/TableJoin.h>
@@ -209,15 +210,47 @@ void calculateHashTableCacheKeys(
         /// that otherwise identical subtrees with different kinds (`INNER` vs `LEFT`) do not collide.
         if (const auto * join_step = dynamic_cast<const JoinStep *>(node.step.get()); join_step && node.children.size() == 2)
         {
-            auto kind = join_step->getJoin()->getTableJoin().kind();
-            auto a = cache_keys[node.children.at(0)];
-            auto b = cache_keys[node.children.at(1)];
+            const auto & table_join = join_step->getJoin()->getTableJoin();
+            auto kind = table_join.kind();
+
+            /// Fold each physical side's equi-keys (with null-safety) and its on-clause residual
+            /// condition into that side's child hash, so they travel with the child under the
+            /// RIGHT->LEFT remap below (keeping `A RIGHT JOIN B ≡ B LEFT JOIN A`). Two joins over the
+            /// same inputs but with different keys/conditions then yield different child
+            /// contributions, hence different cache keys, instead of colliding.
+            SipHash keys_left;
+            SipHash keys_right;
+            for (const auto & clause : table_join.getClauses())
+            {
+                for (size_t i = 0; i < clause.keysCount(); ++i)
+                {
+                    const bool nullsafe = clause.nullsafe_compare_key_indexes.contains(i);
+                    keys_left.update(clause.key_names_left[i]);
+                    keys_left.update(nullsafe);
+                    keys_right.update(clause.key_names_right[i]);
+                    keys_right.update(nullsafe);
+                }
+                const auto [left_cond, right_cond] = clause.condColumnNames();
+                keys_left.update(left_cond);
+                keys_right.update(right_cond);
+            }
+            auto a = cache_keys[node.children.at(0)] ^ keys_left.get64();
+            auto b = cache_keys[node.children.at(1)] ^ keys_right.get64();
             if (isRight(kind))
             {
                 std::swap(a, b);
                 kind = JoinKind::Left;
             }
+            /// Orientation-invariant semantics that still change the join's output and therefore the
+            /// collected statistics: the (remapped) kind, strictness (ALL/ANY/SEMI/ANTI/ASOF),
+            /// `join_use_nulls`, and any residual cross-side predicate in the mixed join expression.
+            /// (Locality is not mixed in: it is a distributed-execution strategy and does not change
+            /// the join result's cardinality, so it doesn't affect the collected output bytes.)
             frame.hash.update(static_cast<uint8_t>(kind));
+            frame.hash.update(static_cast<uint8_t>(table_join.strictness()));
+            frame.hash.update(table_join.joinUseNulls());
+            if (const auto & mixed = table_join.getMixedJoinExpression())
+                mixed->getActionsDAG().updateHash(frame.hash);
             frame.hash.update(a);
             frame.hash.update(b);
         }

@@ -193,25 +193,26 @@ void calculateHashTableCacheKeys(
             continue;
         }
 
-        /// Canonicalize `JoinStep` children order so DP-driven side swaps don't cause the subtree
-        /// hash to diverge between the single-replica and parallel-replicas plan builds in
-        /// `considerEnablingParallelReplicas`. For commutative kinds (`INNER`/`FULL`/`CROSS`/`Comma`)
-        /// sort children by their cache key. For `RIGHT` rely on the equivalence
-        /// `A RIGHT JOIN B ≡ B LEFT JOIN A`: swap the children and also remap the kind to `LEFT`,
-        /// so two structurally equivalent subtrees hash identically. Other kinds keep their
-        /// existing order. The (canonicalized) kind itself is mixed into the hash so that
-        /// otherwise identical subtrees with different kinds (`INNER` vs `LEFT`) do not collide.
+        /// Hash a `JoinStep`'s children in their physical order. `considerEnablingParallelReplicas`
+        /// picks the parallelized side by physical slot (child 0, or child 1 for `RIGHT`) — see
+        /// `ParallelReplicasLocalPlan::findReadingStep` — and later transplants the single-replica
+        /// reading-step analysis onto the parallel-replicas reading step found the same way. So a
+        /// hash match must imply both plans put the *same table* in the same physical slot. We must
+        /// therefore NOT canonicalize commutative kinds by sorting children: if the two plan builds
+        /// pick opposite child orders the parallelized side genuinely differs, and the right outcome
+        /// is to NOT match (skip the optimization) rather than transplant cross-table parts/ranges.
+        ///
+        /// `RIGHT` is the one safe remap: by the equivalence `A RIGHT JOIN B ≡ B LEFT JOIN A` we
+        /// swap the children and remap the kind to `LEFT`. This is consistent with the physical
+        /// selector, which is also kind-aware (`RIGHT`→child 1, `LEFT`→child 0), so both equivalent
+        /// representations resolve to the same table. The (remapped) kind is mixed into the hash so
+        /// that otherwise identical subtrees with different kinds (`INNER` vs `LEFT`) do not collide.
         if (const auto * join_step = dynamic_cast<const JoinStep *>(node.step.get()); join_step && node.children.size() == 2)
         {
             auto kind = join_step->getJoin()->getTableJoin().kind();
             auto a = cache_keys[node.children.at(0)];
             auto b = cache_keys[node.children.at(1)];
-            if (isInner(kind) || isFull(kind) || isCrossOrComma(kind))
-            {
-                if (a > b)
-                    std::swap(a, b);
-            }
-            else if (isRight(kind))
+            if (isRight(kind))
             {
                 std::swap(a, b);
                 kind = JoinKind::Left;

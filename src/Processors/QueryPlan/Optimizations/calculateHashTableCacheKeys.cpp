@@ -273,17 +273,6 @@ void calculateHashTableCacheKeys(
         raw_hashes[&node] = raw;
         cache_keys[&node] = raw;
 
-        /// Make row-preserving transforms fully transparent: take the cache key straight from the
-        /// child. Such steps (e.g. `ExpressionStep`, `BuildRuntimeFilterStep`) carry no
-        /// cardinality-relevant information, so two subtrees that differ only by added/removed
-        /// row-preserving steps between the two Auto-PR plan builds hash to the same key.
-        if (const auto * transform = dynamic_cast<const ITransformingStep *>(node.step.get()))
-        {
-            chassert(node.children.size() == 1);
-            if (transform->getTransformTraits().preserves_number_of_rows)
-                cache_keys[&node] = cache_keys[node.children.front()];
-        }
-
         stack.pop_back();
     }
 }

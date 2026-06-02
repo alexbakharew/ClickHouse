@@ -67,6 +67,11 @@ UInt64 calculateHashFromStep(const ITransformingStep & transform)
         hash.update(filter->getSerializationName());
         filter->getExpression().updateHash(hash);
         hash.update(filter->getFilterColumnName());
+        /// `remove_filter_column` changes the step's output header (and thus the cached
+        /// `output_bytes`), so it must be part of the key, exactly as `FilterStep::serialize`
+        /// includes it. Otherwise two filters that differ only in whether they drop the filter
+        /// column would share a cache entry.
+        hash.update(filter->removesFilterColumn());
         return hash.get64();
     }
 

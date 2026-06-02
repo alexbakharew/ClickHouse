@@ -15,6 +15,12 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Interpreters/Context_fwd.h>
 #include <Common/BlobStorageLogWriter.h>
+#if USE_AZURE_BLOB_STORAGE
+#include <IO/AzureBlobStorage/isRetryableAzureException.h>
+#include <Common/Exception.h>
+#include <Common/logger_useful.h>
+#include <base/sleep.h>
+#endif
 
 namespace DB
 {
@@ -191,6 +197,87 @@ public:
         Int32 status_code,
         const String & error_message);
 
+    /// === Generic error/retry primitives (T1 + Option A) ===
+    ///
+    /// `executeWithRetryRethrow` is the single retry+rethrow primitive that
+    /// replaces today's three distinct retry-loop shapes (the deleted
+    /// `WriteBufferFromAzureBlobStorage::execWithRetry`, and the inline
+    /// for-loops in `ReadBufferFromAzureBlobStorage::nextImpl / initialize
+    /// / readBigAt`). The lambda receives the 0-based attempt number and
+    /// owns any ResourceGuard/throttler scoping it needs — keeping the
+    /// helper agnostic to IO-write vs IO-read scheduling.
+    ///
+    /// `executeWithRethrow` is the catch-only sibling: execute one Azure
+    /// SDK call and translate any `RequestFailedException` to a ClickHouse
+    /// exception via `rethrowAzureException`. No retry, no status-code
+    /// swallowing — sites that need to swallow specific codes (e.g.
+    /// NotFound → false in `exists`) keep their explicit inline if-check.
+    ///
+    /// Both are header-only templates because each call site instantiates
+    /// them with a unique lambda type; an explicit-instantiation cpp
+    /// approach is not practical.
+
+    /// Indirection over `getCurrentExceptionCode() == CANNOT_ALLOCATE_MEMORY`
+    /// so the template body can stay in the header without requiring every
+    /// TU that includes us to declare the `extern const int` for that code.
+    static bool isCannotAllocateMemoryCurrentException();
+
+    template <typename F>
+    static auto executeWithRetryRethrow(
+        LoggerPtr log,
+        std::string_view resource_for_logging,
+        size_t num_tries,
+        F && func) -> decltype(func(size_t{0}))
+    {
+        size_t sleep_ms = 100;
+        for (size_t i = 0; i < num_tries; ++i)
+        {
+            try
+            {
+                return func(i);
+            }
+            catch (const Azure::Core::RequestFailedException & e)
+            {
+                if (i + 1 == num_tries || !isRetryableAzureException(e))
+                    rethrowAzureException(e, std::string{resource_for_logging});
+                LOG_DEBUG(log, "Azure call for `{}` failed at attempt {}/{}: {} {}",
+                          resource_for_logging, i + 1, num_tries, e.what(), e.Message);
+                sleepForMilliseconds(sleep_ms);
+                sleep_ms *= 2;
+            }
+            catch (...)
+            {
+                /// CANNOT_ALLOCATE_MEMORY is the only generic exception we
+                /// refuse to retry — retrying allocation failures wastes
+                /// time and amplifies pressure.
+                if (isCannotAllocateMemoryCurrentException())
+                    throw;
+                if (i + 1 == num_tries)
+                    throw;
+                LOG_DEBUG(log, "Azure call for `{}` failed at attempt {}/{}: {}",
+                          resource_for_logging, i + 1, num_tries,
+                          getCurrentExceptionMessage(false));
+                sleepForMilliseconds(sleep_ms);
+                sleep_ms *= 2;
+            }
+        }
+        UNREACHABLE();
+    }
+
+    template <typename F>
+    static auto executeWithRethrow(std::string_view resource_for_logging, F && func)
+        -> decltype(func())
+    {
+        try
+        {
+            return func();
+        }
+        catch (const Azure::Core::RequestFailedException & e)
+        {
+            rethrowAzureException(e, std::string{resource_for_logging});
+        }
+    }
+
     /// === Data-plane wrappers (excessively named, no overloads) ===
     ///
     /// Each method corresponds to exactly one SDK call shape at exactly
@@ -225,16 +312,26 @@ public:
         getBlobPropertiesForUploadVerification(const String & blob_name) const;
 
     /// ReadBuffer::initialize TTFB download with retry-attempt context.
+    /// Per-attempt BlobStorageLog success/failure event and the Read-side
+    /// error counter (`ReadBufferFromAzureRequestsErrors`) are recorded
+    /// inside this method, symmetric with the upload methods.
     Azure::Response<Azure::Storage::Blobs::Models::DownloadBlobResult>
         downloadBlobBodyStreamWithAttemptContext(
             const String & blob_name,
             const Azure::Storage::Blobs::DownloadBlobOptions & options,
-            size_t attempt) const;
+            size_t attempt,
+            const BlobStorageLogWriterPtr & blob_log,
+            const String & container_for_logging,
+            size_t length_or_zero_for_failure_logging) const;
     /// ReadBuffer::readBigAt random-access download (no retry attempt key).
+    /// Same per-attempt BlobStorageLog + Read error counter as above.
     Azure::Response<Azure::Storage::Blobs::Models::DownloadBlobResult>
         downloadBlobBodyStreamForReadBigAt(
             const String & blob_name,
-            const Azure::Storage::Blobs::DownloadBlobOptions & options) const;
+            const Azure::Storage::Blobs::DownloadBlobOptions & options,
+            const BlobStorageLogWriterPtr & blob_log,
+            const String & container_for_logging,
+            size_t n_for_logging) const;
 
     /// WriteBuffer single-part upload path: access conditions, retry-attempt
     /// SDK context, and BlobStorageLog recording (success and failure).

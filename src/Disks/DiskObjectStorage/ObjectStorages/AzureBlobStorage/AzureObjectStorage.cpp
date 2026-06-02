@@ -400,27 +400,25 @@ static void setAzureBlobTag(
     const Strings & blob_names,
     const String & tag_key,
     const String & tag_value)
-try
 {
-    auto log = getLogger("setAzureBlobTag");
-    for (const auto & blob_name : blob_names)
+    AzureBlobStorage::ContainerClientWrapper::executeWithRethrow(tag_key, [&]
     {
-        auto tags = client_ptr->getBlobTagsForUpdate(blob_name);
-        const auto tag_iter = tags.find(tag_key);
-        if (tag_iter != tags.end() && tag_iter->second == tag_value)
+        auto log = getLogger("setAzureBlobTag");
+        for (const auto & blob_name : blob_names)
         {
-            LOG_TRACE(log, "Azure blob {} skipped as it already had the tag {}={}", blob_name, tag_key, tag_value);
-            continue;
-        }
+            auto tags = client_ptr->getBlobTagsForUpdate(blob_name);
+            const auto tag_iter = tags.find(tag_key);
+            if (tag_iter != tags.end() && tag_iter->second == tag_value)
+            {
+                LOG_TRACE(log, "Azure blob {} skipped as it already had the tag {}={}", blob_name, tag_key, tag_value);
+                continue;
+            }
 
-        tags[tag_key] = tag_value;
-        client_ptr->setBlobTags(blob_name, tags);
-        LOG_TRACE(log, "Tags of Azure blob {} updated", blob_name);
-    }
-}
-catch (const Azure::Storage::StorageException & e)
-{
-    rethrowAzureException(e, tag_key);
+            tags[tag_key] = tag_value;
+            client_ptr->setBlobTags(blob_name, tags);
+            LOG_TRACE(log, "Tags of Azure blob {} updated", blob_name);
+        }
+    });
 }
 
 void AzureObjectStorage::tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value)
@@ -431,25 +429,23 @@ void AzureObjectStorage::tagObjects(const StoredObjects & objects, const std::st
 }
 
 ObjectMetadata AzureObjectStorage::getObjectMetadata(const std::string & path, bool) const
-try
 {
-    auto client_ptr = client.get();
-    auto properties = client_ptr->getBlobPropertiesForMetadata(path).Value;
-
-    ObjectMetadata result;
-    result.size_bytes = properties.BlobSize;
-    if (!properties.Metadata.empty())
+    return AzureBlobStorage::ContainerClientWrapper::executeWithRethrow(path, [&]
     {
-        result.attributes.emplace();
-        for (const auto & [key, value] : properties.Metadata)
-            result.attributes[key] = value;
-    }
-    result.last_modified = static_cast<std::chrono::system_clock::time_point>(properties.LastModified).time_since_epoch().count();
-    return result;
-}
-catch (const Azure::Storage::StorageException & e)
-{
-    rethrowAzureException(e, path);
+        auto client_ptr = client.get();
+        auto properties = client_ptr->getBlobPropertiesForMetadata(path).Value;
+
+        ObjectMetadata result;
+        result.size_bytes = properties.BlobSize;
+        if (!properties.Metadata.empty())
+        {
+            result.attributes.emplace();
+            for (const auto & [key, value] : properties.Metadata)
+                result.attributes[key] = value;
+        }
+        result.last_modified = static_cast<std::chrono::system_clock::time_point>(properties.LastModified).time_since_epoch().count();
+        return result;
+    });
 }
 
 std::optional<ObjectMetadata> AzureObjectStorage::tryGetObjectMetadata(const std::string & path, bool with_tags) const

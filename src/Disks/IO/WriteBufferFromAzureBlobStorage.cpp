@@ -16,7 +16,6 @@ namespace ErrorCodes
 {
     extern const int AZURE_BLOB_STORAGE_ERROR;
     extern const int LOGICAL_ERROR;
-    extern const int CANNOT_ALLOCATE_MEMORY;
 }
 
 struct WriteBufferFromAzureBlobStorage::PartData
@@ -98,41 +97,10 @@ WriteBufferFromAzureBlobStorage::~WriteBufferFromAzureBlobStorage()
     task_tracker->safeWaitAll();
 }
 
-void WriteBufferFromAzureBlobStorage::execWithRetry(std::function<void(size_t)> func, size_t num_tries, size_t cost)
-{
-    size_t sleep_time_with_backoff_milliseconds = 100;
-    for (size_t i = 0; i < num_tries; ++i)
-    {
-        try
-        {
-            ResourceGuard rlock(ResourceGuard::Metrics::getIOWrite(), write_settings.io_scheduling.write_resource_link, cost); // Note that zero-cost requests are ignored
-            func(i);
-            rlock.unlock(cost);
-            break;
-        }
-        catch (const Azure::Core::RequestFailedException & e)
-        {
-            if (i == num_tries - 1 || !isRetryableAzureException(e))
-                rethrowAzureException(e, blob_path);
-
-            LOG_DEBUG(log, "Write at attempt {} for blob `{}` failed: {} {}", i + 1, blob_path, e.what(), e.Message);
-            sleepForMilliseconds(sleep_time_with_backoff_milliseconds);
-            sleep_time_with_backoff_milliseconds *= 2;
-        }
-        catch (...)
-        {
-            if (getCurrentExceptionCode() == ErrorCodes::CANNOT_ALLOCATE_MEMORY)
-                throw;
-
-            if (i == num_tries - 1)
-                throw;
-
-            LOG_DEBUG(log, "Write at attempt {} for blob `{}` failed: {}", i + 1, blob_path, getCurrentExceptionMessage(false));
-            sleepForMilliseconds(sleep_time_with_backoff_milliseconds);
-            sleep_time_with_backoff_milliseconds *= 2;
-        }
-    }
-}
+/// `execWithRetry` was the WriteBuffer-local retry helper. It is now replaced
+/// by `AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow`,
+/// which is shared with ReadBuffer's retry sites. The four upload/stage/
+/// commit sites below construct their own ResourceGuard inside the lambda.
 
 void WriteBufferFromAzureBlobStorage::preFinalize()
 {
@@ -159,9 +127,13 @@ void WriteBufferFromAzureBlobStorage::preFinalize()
             Azure::Core::IO::MemoryBodyStream memory_stream(
                 reinterpret_cast<const uint8_t *>(part_data.memory.data()), part_data.data_size);
 
-            execWithRetry(
+            AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow(
+                log, blob_path, max_unexpected_write_error_retries,
                 [&](size_t retry_attempt)
                 {
+                    ResourceGuard rlock(ResourceGuard::Metrics::getIOWrite(),
+                                        write_settings.io_scheduling.write_resource_link,
+                                        part_data.data_size);
                     Azure::Storage::Blobs::UploadBlockBlobOptions options;
 
                     if (!write_settings.object_storage_write_if_none_match.empty())
@@ -173,9 +145,8 @@ void WriteBufferFromAzureBlobStorage::preFinalize()
                     blob_container_client->uploadSinglePartWithAccessConditionsAndRetryContext(
                         blob_path, memory_stream, options, retry_attempt,
                         blob_log, container_for_logging, part_data.data_size);
-                },
-                max_unexpected_write_error_retries,
-                part_data.data_size);
+                    rlock.unlock(part_data.data_size);
+                });
 
             LOG_TRACE(limited_log, "Committed single block for blob `{}`", blob_path);
 
@@ -187,9 +158,13 @@ void WriteBufferFromAzureBlobStorage::preFinalize()
         {
             Azure::Core::IO::MemoryBodyStream memory_stream(nullptr, 0);
 
-            execWithRetry(
+            AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow(
+                log, blob_path, max_unexpected_write_error_retries,
                 [&](size_t retry_attempt)
                 {
+                    /// Empty single-block upload — zero-cost, no ResourceGuard
+                    /// (matches the previous behaviour where cost=0 was passed
+                    /// to `execWithRetry`, which ignores zero-cost requests).
                     Azure::Storage::Blobs::UploadBlockBlobOptions options;
 
                     if (!write_settings.object_storage_write_if_none_match.empty())
@@ -201,9 +176,7 @@ void WriteBufferFromAzureBlobStorage::preFinalize()
                     blob_container_client->uploadSinglePartWithAccessConditionsAndRetryContext(
                         blob_path, memory_stream, options, retry_attempt,
                         blob_log, container_for_logging, /* data_size */ 0);
-                },
-                max_unexpected_write_error_retries,
-                /* cost */0);
+                });
 
             LOG_TRACE(log, "Committed single empty block for blob `{}`", blob_path);
             return;
@@ -227,9 +200,12 @@ void WriteBufferFromAzureBlobStorage::finalizeImpl()
 
     if (!block_ids.empty())
     {
-        execWithRetry(
+        AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow(
+            log, blob_path, max_unexpected_write_error_retries,
             [&](size_t retry_attempt)
             {
+                /// CommitBlockList is a control-plane call (no body bytes),
+                /// historically called with cost=0 — no ResourceGuard here.
                 Azure::Storage::Blobs::CommitBlockListOptions options;
 
                 if (!write_settings.object_storage_write_if_none_match.empty())
@@ -241,8 +217,7 @@ void WriteBufferFromAzureBlobStorage::finalizeImpl()
                 blob_container_client->commitBlockListWithAccessConditionsAndRetryContext(
                     blob_path, block_ids, options, retry_attempt,
                     blob_log, container_for_logging);
-            },
-            max_unexpected_write_error_retries);
+            });
 
         LOG_TRACE(limited_log, "Committed {} blocks for blob `{}`", block_ids.size(), blob_path);
     }
@@ -376,15 +351,18 @@ void WriteBufferFromAzureBlobStorage::writePart(WriteBufferFromAzureBlobStorage:
 
         Azure::Core::IO::MemoryBodyStream memory_stream(reinterpret_cast<const uint8_t *>(std::get<1>(*worker_data).memory.data()), data_size);
 
-        execWithRetry(
+        AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow(
+            log, blob_path, max_unexpected_write_error_retries,
             [&](size_t retry_attempt)
             {
+                ResourceGuard rlock(ResourceGuard::Metrics::getIOWrite(),
+                                    write_settings.io_scheduling.write_resource_link,
+                                    data_size);
                 blob_container_client->stageBlockWithRetryContextAndBlobStorageLog(
                     blob_path, data_block_id, memory_stream, retry_attempt,
                     blob_log, container_for_logging, data_size);
-            },
-            max_unexpected_write_error_retries,
-            data_size);
+                rlock.unlock(data_size);
+            });
     };
 
     task_tracker->add(std::move(upload_worker));

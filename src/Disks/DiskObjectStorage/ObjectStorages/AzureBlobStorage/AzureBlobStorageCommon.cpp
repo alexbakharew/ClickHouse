@@ -45,6 +45,8 @@ namespace ProfileEvents
     extern const Event AzureGetObject;
     extern const Event DiskAzureGetObject;
 
+    extern const Event ReadBufferFromAzureRequestsErrors;
+
     extern const Event AzureGetRequestThrottlerCount;
     extern const Event AzureGetRequestThrottlerBlocked;
     extern const Event AzureGetRequestThrottlerSleepMicroseconds;
@@ -108,6 +110,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
     extern const int AZURE_BLOB_STORAGE_ERROR;
+    extern const int CANNOT_ALLOCATE_MEMORY;
 }
 
 namespace AzureBlobStorage
@@ -374,24 +377,77 @@ Azure::Response<Azure::Storage::Blobs::Models::DownloadBlobResult>
 ContainerClientWrapper::downloadBlobBodyStreamWithAttemptContext(
     const String & blob_name,
     const Azure::Storage::Blobs::DownloadBlobOptions & options,
-    size_t attempt) const
+    size_t attempt,
+    const BlobStorageLogWriterPtr & blob_log,
+    const String & container_for_logging,
+    size_t length_or_zero_for_failure_logging) const
 {
     traceAzureGetObject();
     auto azure_context = Azure::Core::Context()
         .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), attempt);
-    return client.GetBlobClient(blob_prefix + blob_name).Download(options, azure_context);
+
+    Stopwatch watch;
+    try
+    {
+        auto response = client.GetBlobClient(blob_prefix + blob_name).Download(options, azure_context);
+        logBlobStorageEventOnSuccess(
+            blob_log, BlobStorageLogElement::EventType::Read,
+            container_for_logging, blob_prefix + blob_name,
+            /* data_size */ static_cast<size_t>(response.Value.BodyStream->Length()),
+            watch.elapsedMicroseconds());
+        return response;
+    }
+    catch (const Azure::Core::RequestFailedException & e)
+    {
+        logBlobStorageEventOnFailure(
+            blob_log, BlobStorageLogElement::EventType::Read,
+            container_for_logging, blob_prefix + blob_name,
+            length_or_zero_for_failure_logging, watch.elapsedMicroseconds(),
+            static_cast<Int32>(e.StatusCode), e.Message);
+        ProfileEvents::increment(ProfileEvents::ReadBufferFromAzureRequestsErrors);
+        throw;
+    }
 }
 
 Azure::Response<Azure::Storage::Blobs::Models::DownloadBlobResult>
 ContainerClientWrapper::downloadBlobBodyStreamForReadBigAt(
     const String & blob_name,
-    const Azure::Storage::Blobs::DownloadBlobOptions & options) const
+    const Azure::Storage::Blobs::DownloadBlobOptions & options,
+    const BlobStorageLogWriterPtr & blob_log,
+    const String & container_for_logging,
+    size_t n_for_logging) const
 {
     traceAzureGetObject();
     /// readBigAt historically uses attempt=0 unconditionally.
     auto azure_context = Azure::Core::Context()
         .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), size_t{0});
-    return client.GetBlobClient(blob_prefix + blob_name).Download(options, azure_context);
+
+    Stopwatch watch;
+    try
+    {
+        auto response = client.GetBlobClient(blob_prefix + blob_name).Download(options, azure_context);
+        logBlobStorageEventOnSuccess(
+            blob_log, BlobStorageLogElement::EventType::Read,
+            container_for_logging, blob_prefix + blob_name,
+            /* data_size */ n_for_logging,
+            watch.elapsedMicroseconds());
+        return response;
+    }
+    catch (const Azure::Core::RequestFailedException & e)
+    {
+        logBlobStorageEventOnFailure(
+            blob_log, BlobStorageLogElement::EventType::Read,
+            container_for_logging, blob_prefix + blob_name,
+            n_for_logging, watch.elapsedMicroseconds(),
+            static_cast<Int32>(e.StatusCode), e.Message);
+        ProfileEvents::increment(ProfileEvents::ReadBufferFromAzureRequestsErrors);
+        throw;
+    }
+}
+
+bool ContainerClientWrapper::isCannotAllocateMemoryCurrentException()
+{
+    return getCurrentExceptionCode() == ErrorCodes::CANNOT_ALLOCATE_MEMORY;
 }
 
 Azure::Response<Azure::Storage::Blobs::Models::UploadBlockBlobResult>

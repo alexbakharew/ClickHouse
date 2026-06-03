@@ -378,7 +378,6 @@ void copyAzureBlobStorageFile(
     {
         /// Do native copy
         LOG_TRACE(log, "Copying Blob: {} from Container: {} using native copy", src_blob, src_container_for_logging);
-        dest_client->traceAzureCopyObject();
 
         try
         {

@@ -13,9 +13,11 @@
 #include <Common/ProxyConfigurationResolverProvider.h>
 #include <IO/AzureBlobStorage/PocoHTTPClient.h>
 #include <IO/AzureBlobStorage/isRetryableAzureException.h>
+#include <IO/WriteSettings.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
+#include <Common/Scheduler/ResourceGuard.h>
 #include <Common/re2.h>
 #include <Core/Settings.h>
 #include <Poco/Util/AbstractConfiguration.h>
@@ -351,10 +353,13 @@ ContainerClientWrapper::getBlobPropertiesForExistenceCheck(const String & blob_n
 }
 
 Azure::Response<Azure::Storage::Blobs::Models::BlobProperties>
-ContainerClientWrapper::getBlobPropertiesForMetadata(const String & blob_name) const
+ContainerClientWrapper::getBlobPropertiesForMetadataWithRethrow(const String & blob_name) const
 {
-    traceAzureGetProperties();
-    return client.GetBlobClient(blob_prefix + blob_name).GetProperties();
+    return executeWithRethrow(blob_name, [&]
+    {
+        traceAzureGetProperties();
+        return client.GetBlobClient(blob_prefix + blob_name).GetProperties();
+    });
 }
 
 Azure::Response<Azure::Storage::Blobs::Models::BlobProperties>
@@ -374,75 +379,103 @@ ContainerClientWrapper::getBlobPropertiesForUploadVerification(const String & bl
 }
 
 Azure::Response<Azure::Storage::Blobs::Models::DownloadBlobResult>
-ContainerClientWrapper::downloadBlobBodyStreamWithAttemptContext(
+ContainerClientWrapper::downloadBlobBodyStreamWithAttemptContextAndAutoRetry(
     const String & blob_name,
-    const Azure::Storage::Blobs::DownloadBlobOptions & options,
-    size_t attempt,
+    size_t range_offset,
+    size_t range_length_or_zero,
+    size_t outer_attempt,
+    size_t num_tries,
+    LoggerPtr log,
     const BlobStorageLogWriterPtr & blob_log,
-    const String & container_for_logging,
-    size_t length_or_zero_for_failure_logging) const
+    const String & container_for_logging) const
 {
-    traceAzureGetObject();
-    auto azure_context = Azure::Core::Context()
-        .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), attempt);
+    return executeWithRetryRethrow(
+        log, blob_name, num_tries,
+        [&](size_t /*inner_attempt*/)
+        {
+            Azure::Storage::Blobs::DownloadBlobOptions options;
+            Azure::Nullable<int64_t> length{};
+            if (range_length_or_zero != 0)
+                length = {static_cast<int64_t>(range_length_or_zero)};
+            options.Range = {static_cast<int64_t>(range_offset), length};
 
-    Stopwatch watch;
-    try
-    {
-        auto response = client.GetBlobClient(blob_prefix + blob_name).Download(options, azure_context);
-        logBlobStorageEventOnSuccess(
-            blob_log, BlobStorageLogElement::EventType::Read,
-            container_for_logging, blob_prefix + blob_name,
-            /* data_size */ static_cast<size_t>(response.Value.BodyStream->Length()),
-            watch.elapsedMicroseconds());
-        return response;
-    }
-    catch (const Azure::Core::RequestFailedException & e)
-    {
-        logBlobStorageEventOnFailure(
-            blob_log, BlobStorageLogElement::EventType::Read,
-            container_for_logging, blob_prefix + blob_name,
-            length_or_zero_for_failure_logging, watch.elapsedMicroseconds(),
-            static_cast<Int32>(e.StatusCode), e.Message);
-        ProfileEvents::increment(ProfileEvents::ReadBufferFromAzureRequestsErrors);
-        throw;
-    }
+            traceAzureGetObject();
+            /// The SDK retry-context attempt is the OUTER attempt (from
+            /// `nextImpl`'s retry loop), fixed across this initialize() call's
+            /// inner retries — matches pre-refactor behaviour where
+            /// `azure_context` was built once from `attempt` before the inner
+            /// loop.
+            auto azure_context = Azure::Core::Context()
+                .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), outer_attempt);
+
+            Stopwatch watch;
+            try
+            {
+                auto response = client.GetBlobClient(blob_prefix + blob_name).Download(options, azure_context);
+                logBlobStorageEventOnSuccess(
+                    blob_log, BlobStorageLogElement::EventType::Read,
+                    container_for_logging, blob_prefix + blob_name,
+                    /* data_size */ static_cast<size_t>(response.Value.BodyStream->Length()),
+                    watch.elapsedMicroseconds());
+                return response;
+            }
+            catch (const Azure::Core::RequestFailedException & e)
+            {
+                logBlobStorageEventOnFailure(
+                    blob_log, BlobStorageLogElement::EventType::Read,
+                    container_for_logging, blob_prefix + blob_name,
+                    range_length_or_zero, watch.elapsedMicroseconds(),
+                    static_cast<Int32>(e.StatusCode), e.Message);
+                ProfileEvents::increment(ProfileEvents::ReadBufferFromAzureRequestsErrors);
+                throw;
+            }
+        });
 }
 
 Azure::Response<Azure::Storage::Blobs::Models::DownloadBlobResult>
-ContainerClientWrapper::downloadBlobBodyStreamForReadBigAt(
+ContainerClientWrapper::downloadBlobBodyStreamForReadBigAtAndAutoRetry(
     const String & blob_name,
-    const Azure::Storage::Blobs::DownloadBlobOptions & options,
+    size_t range_offset,
+    size_t range_length,
+    size_t num_tries,
+    LoggerPtr log,
     const BlobStorageLogWriterPtr & blob_log,
-    const String & container_for_logging,
-    size_t n_for_logging) const
+    const String & container_for_logging) const
 {
-    traceAzureGetObject();
-    /// readBigAt historically uses attempt=0 unconditionally.
-    auto azure_context = Azure::Core::Context()
-        .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), size_t{0});
+    return executeWithRetryRethrow(
+        log, blob_name, num_tries,
+        [&](size_t /*attempt*/)
+        {
+            Azure::Storage::Blobs::DownloadBlobOptions options;
+            options.Range = {static_cast<int64_t>(range_offset), static_cast<int64_t>(range_length)};
 
-    Stopwatch watch;
-    try
-    {
-        auto response = client.GetBlobClient(blob_prefix + blob_name).Download(options, azure_context);
-        logBlobStorageEventOnSuccess(
-            blob_log, BlobStorageLogElement::EventType::Read,
-            container_for_logging, blob_prefix + blob_name,
-            /* data_size */ n_for_logging,
-            watch.elapsedMicroseconds());
-        return response;
-    }
-    catch (const Azure::Core::RequestFailedException & e)
-    {
-        logBlobStorageEventOnFailure(
-            blob_log, BlobStorageLogElement::EventType::Read,
-            container_for_logging, blob_prefix + blob_name,
-            n_for_logging, watch.elapsedMicroseconds(),
-            static_cast<Int32>(e.StatusCode), e.Message);
-        ProfileEvents::increment(ProfileEvents::ReadBufferFromAzureRequestsErrors);
-        throw;
-    }
+            traceAzureGetObject();
+            /// readBigAt historically uses attempt=0 unconditionally.
+            auto azure_context = Azure::Core::Context()
+                .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), size_t{0});
+
+            Stopwatch watch;
+            try
+            {
+                auto response = client.GetBlobClient(blob_prefix + blob_name).Download(options, azure_context);
+                logBlobStorageEventOnSuccess(
+                    blob_log, BlobStorageLogElement::EventType::Read,
+                    container_for_logging, blob_prefix + blob_name,
+                    /* data_size */ range_length,
+                    watch.elapsedMicroseconds());
+                return response;
+            }
+            catch (const Azure::Core::RequestFailedException & e)
+            {
+                logBlobStorageEventOnFailure(
+                    blob_log, BlobStorageLogElement::EventType::Read,
+                    container_for_logging, blob_prefix + blob_name,
+                    range_length, watch.elapsedMicroseconds(),
+                    static_cast<Int32>(e.StatusCode), e.Message);
+                ProfileEvents::increment(ProfileEvents::ReadBufferFromAzureRequestsErrors);
+                throw;
+            }
+        });
 }
 
 bool ContainerClientWrapper::isCannotAllocateMemoryCurrentException()
@@ -451,39 +484,60 @@ bool ContainerClientWrapper::isCannotAllocateMemoryCurrentException()
 }
 
 Azure::Response<Azure::Storage::Blobs::Models::UploadBlockBlobResult>
-ContainerClientWrapper::uploadSinglePartWithAccessConditionsAndRetryContext(
+ContainerClientWrapper::uploadSinglePartWithAccessConditionsAndIOWriteSchedulingAndAutoRetry(
     const String & blob_name,
-    Azure::Core::IO::BodyStream & stream,
-    const Azure::Storage::Blobs::UploadBlockBlobOptions & options,
-    size_t attempt,
+    const UploadPartData & part_data,
+    const WriteSettings & write_settings,
+    size_t num_tries,
+    LoggerPtr log,
     const BlobStorageLogWriterPtr & blob_log,
-    const String & container_for_logging,
-    size_t data_size_for_logging) const
+    const String & container_for_logging) const
 {
-    traceAzureUpload();
-    auto bbc = client.GetBlockBlobClient(blob_prefix + blob_name);
-    auto azure_context = Azure::Core::Context()
-        .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), attempt);
+    return executeWithRetryRethrow(
+        log, blob_name, num_tries,
+        [&](size_t attempt)
+        {
+            /// data_size=0 → ResourceGuard is a no-op (zero-cost requests
+            /// are ignored), matching today's empty-upload behaviour.
+            ResourceGuard rlock(ResourceGuard::Metrics::getIOWrite(),
+                                write_settings.io_scheduling.write_resource_link,
+                                part_data.data_size);
+            Azure::Core::IO::MemoryBodyStream stream(
+                reinterpret_cast<const uint8_t *>(part_data.memory.data()),
+                part_data.data_size);
 
-    Stopwatch watch;
-    try
-    {
-        auto response = bbc.Upload(stream, options, azure_context);
-        logBlobStorageEventOnSuccess(
-            blob_log, BlobStorageLogElement::EventType::Upload,
-            container_for_logging, blob_prefix + blob_name,
-            data_size_for_logging, watch.elapsedMicroseconds());
-        return response;
-    }
-    catch (const Azure::Core::RequestFailedException & e)
-    {
-        logBlobStorageEventOnFailure(
-            blob_log, BlobStorageLogElement::EventType::Upload,
-            container_for_logging, blob_prefix + blob_name,
-            data_size_for_logging, watch.elapsedMicroseconds(),
-            static_cast<Int32>(e.StatusCode), e.Message);
-        throw;
-    }
+            Azure::Storage::Blobs::UploadBlockBlobOptions options;
+            if (!write_settings.object_storage_write_if_none_match.empty())
+                options.AccessConditions.IfNoneMatch = Azure::ETag(write_settings.object_storage_write_if_none_match);
+            if (!write_settings.object_storage_write_if_match.empty())
+                options.AccessConditions.IfMatch = Azure::ETag(write_settings.object_storage_write_if_match);
+
+            traceAzureUpload();
+            auto bbc = client.GetBlockBlobClient(blob_prefix + blob_name);
+            auto azure_context = Azure::Core::Context()
+                .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), attempt);
+
+            Stopwatch watch;
+            try
+            {
+                auto response = bbc.Upload(stream, options, azure_context);
+                logBlobStorageEventOnSuccess(
+                    blob_log, BlobStorageLogElement::EventType::Upload,
+                    container_for_logging, blob_prefix + blob_name,
+                    part_data.data_size, watch.elapsedMicroseconds());
+                rlock.unlock(part_data.data_size);
+                return response;
+            }
+            catch (const Azure::Core::RequestFailedException & e)
+            {
+                logBlobStorageEventOnFailure(
+                    blob_log, BlobStorageLogElement::EventType::Upload,
+                    container_for_logging, blob_prefix + blob_name,
+                    part_data.data_size, watch.elapsedMicroseconds(),
+                    static_cast<Int32>(e.StatusCode), e.Message);
+                throw;
+            }
+        });
 }
 
 void ContainerClientWrapper::uploadSinglePartForCopyWithBlobStorageLog(
@@ -514,38 +568,52 @@ void ContainerClientWrapper::uploadSinglePartForCopyWithBlobStorageLog(
     }
 }
 
-void ContainerClientWrapper::stageBlockWithRetryContextAndBlobStorageLog(
+void ContainerClientWrapper::stageBlockWithIOWriteSchedulingAndAutoRetry(
     const String & blob_name,
     const String & block_id,
-    Azure::Core::IO::BodyStream & stream,
-    size_t attempt,
+    const UploadPartData & part_data,
+    const WriteSettings & write_settings,
+    size_t num_tries,
+    LoggerPtr log,
     const BlobStorageLogWriterPtr & blob_log,
-    const String & container_for_logging,
-    size_t data_size_for_logging) const
+    const String & container_for_logging) const
 {
-    traceAzureStageBlock();
-    auto bbc = client.GetBlockBlobClient(blob_prefix + blob_name);
-    auto azure_context = Azure::Core::Context()
-        .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), attempt);
+    executeWithRetryRethrow(
+        log, blob_name, num_tries,
+        [&](size_t attempt)
+        {
+            ResourceGuard rlock(ResourceGuard::Metrics::getIOWrite(),
+                                write_settings.io_scheduling.write_resource_link,
+                                part_data.data_size);
+            Azure::Core::IO::MemoryBodyStream stream(
+                reinterpret_cast<const uint8_t *>(part_data.memory.data()),
+                part_data.data_size);
 
-    Stopwatch watch;
-    try
-    {
-        bbc.StageBlock(block_id, stream, Azure::Storage::Blobs::StageBlockOptions{}, azure_context);
-        logBlobStorageEventOnSuccess(
-            blob_log, BlobStorageLogElement::EventType::MultiPartUploadWrite,
-            container_for_logging, blob_prefix + blob_name,
-            data_size_for_logging, watch.elapsedMicroseconds());
-    }
-    catch (const Azure::Core::RequestFailedException & e)
-    {
-        logBlobStorageEventOnFailure(
-            blob_log, BlobStorageLogElement::EventType::MultiPartUploadWrite,
-            container_for_logging, blob_prefix + blob_name,
-            data_size_for_logging, watch.elapsedMicroseconds(),
-            static_cast<Int32>(e.StatusCode), e.Message);
-        throw;
-    }
+            traceAzureStageBlock();
+            auto bbc = client.GetBlockBlobClient(blob_prefix + blob_name);
+            auto azure_context = Azure::Core::Context()
+                .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), attempt);
+
+            Stopwatch watch;
+            try
+            {
+                bbc.StageBlock(block_id, stream, Azure::Storage::Blobs::StageBlockOptions{}, azure_context);
+                logBlobStorageEventOnSuccess(
+                    blob_log, BlobStorageLogElement::EventType::MultiPartUploadWrite,
+                    container_for_logging, blob_prefix + blob_name,
+                    part_data.data_size, watch.elapsedMicroseconds());
+                rlock.unlock(part_data.data_size);
+            }
+            catch (const Azure::Core::RequestFailedException & e)
+            {
+                logBlobStorageEventOnFailure(
+                    blob_log, BlobStorageLogElement::EventType::MultiPartUploadWrite,
+                    container_for_logging, blob_prefix + blob_name,
+                    part_data.data_size, watch.elapsedMicroseconds(),
+                    static_cast<Int32>(e.StatusCode), e.Message);
+                throw;
+            }
+        });
 }
 
 void ContainerClientWrapper::stageBlockForCopyWithBlobStorageLog(
@@ -578,37 +646,49 @@ void ContainerClientWrapper::stageBlockForCopyWithBlobStorageLog(
     }
 }
 
-void ContainerClientWrapper::commitBlockListWithAccessConditionsAndRetryContext(
+void ContainerClientWrapper::commitBlockListWithAccessConditionsAndAutoRetry(
     const String & blob_name,
     const std::vector<std::string> & block_ids,
-    const Azure::Storage::Blobs::CommitBlockListOptions & options,
-    size_t attempt,
+    const WriteSettings & write_settings,
+    size_t num_tries,
+    LoggerPtr log,
     const BlobStorageLogWriterPtr & blob_log,
     const String & container_for_logging) const
 {
-    traceAzureCommitBlockList();
-    auto bbc = client.GetBlockBlobClient(blob_prefix + blob_name);
-    auto azure_context = Azure::Core::Context()
-        .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), attempt);
+    executeWithRetryRethrow(
+        log, blob_name, num_tries,
+        [&](size_t attempt)
+        {
+            Azure::Storage::Blobs::CommitBlockListOptions options;
+            if (!write_settings.object_storage_write_if_none_match.empty())
+                options.AccessConditions.IfNoneMatch = Azure::ETag(write_settings.object_storage_write_if_none_match);
+            if (!write_settings.object_storage_write_if_match.empty())
+                options.AccessConditions.IfMatch = Azure::ETag(write_settings.object_storage_write_if_match);
 
-    Stopwatch watch;
-    try
-    {
-        bbc.CommitBlockList(block_ids, options, azure_context);
-        logBlobStorageEventOnSuccess(
-            blob_log, BlobStorageLogElement::EventType::MultiPartUploadComplete,
-            container_for_logging, blob_prefix + blob_name,
-            /* data_size */ 0, watch.elapsedMicroseconds());
-    }
-    catch (const Azure::Core::RequestFailedException & e)
-    {
-        logBlobStorageEventOnFailure(
-            blob_log, BlobStorageLogElement::EventType::MultiPartUploadComplete,
-            container_for_logging, blob_prefix + blob_name,
-            /* data_size */ 0, watch.elapsedMicroseconds(),
-            static_cast<Int32>(e.StatusCode), e.Message);
-        throw;
-    }
+            traceAzureCommitBlockList();
+            auto bbc = client.GetBlockBlobClient(blob_prefix + blob_name);
+            auto azure_context = Azure::Core::Context()
+                .WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), attempt);
+
+            Stopwatch watch;
+            try
+            {
+                bbc.CommitBlockList(block_ids, options, azure_context);
+                logBlobStorageEventOnSuccess(
+                    blob_log, BlobStorageLogElement::EventType::MultiPartUploadComplete,
+                    container_for_logging, blob_prefix + blob_name,
+                    /* data_size */ 0, watch.elapsedMicroseconds());
+            }
+            catch (const Azure::Core::RequestFailedException & e)
+            {
+                logBlobStorageEventOnFailure(
+                    blob_log, BlobStorageLogElement::EventType::MultiPartUploadComplete,
+                    container_for_logging, blob_prefix + blob_name,
+                    /* data_size */ 0, watch.elapsedMicroseconds(),
+                    static_cast<Int32>(e.StatusCode), e.Message);
+                throw;
+            }
+        });
 }
 
 void ContainerClientWrapper::commitBlockListForCopyWithBlobStorageLog(
@@ -723,6 +803,29 @@ std::map<std::string, std::string> ContainerClientWrapper::getBlobTagsForUpdate(
 void ContainerClientWrapper::setBlobTags(const String & blob_name, const std::map<std::string, std::string> & tags) const
 {
     client.GetBlobClient(blob_prefix + blob_name).SetTags(tags);
+}
+
+bool ContainerClientWrapper::updateSingleBlobTagIfDifferentWithRethrow(
+    const String & blob_name,
+    const String & tag_key,
+    const String & tag_value,
+    LoggerPtr log) const
+{
+    return executeWithRethrow(tag_key, [&]
+    {
+        auto tags = getBlobTagsForUpdate(blob_name);
+        const auto tag_iter = tags.find(tag_key);
+        if (tag_iter != tags.end() && tag_iter->second == tag_value)
+        {
+            LOG_TRACE(log, "Azure blob {} skipped as it already had the tag {}={}",
+                      blob_name, tag_key, tag_value);
+            return false;
+        }
+        tags[tag_key] = tag_value;
+        setBlobTags(blob_name, tags);
+        LOG_TRACE(log, "Tags of Azure blob {} updated", blob_name);
+        return true;
+    });
 }
 
 String ContainerClientWrapper::getBlobUrlForServerSideCopy(const String & blob_name) const

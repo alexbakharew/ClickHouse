@@ -49,7 +49,7 @@ public:
     void sync() override { next(); }
 
 private:
-    struct PartData;
+    using PartData = AzureBlobStorage::UploadPartData;
 
     void writeMultipartUpload();
     void writePart(PartData && part_data);

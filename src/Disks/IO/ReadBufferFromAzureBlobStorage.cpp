@@ -220,32 +220,15 @@ void ReadBufferFromAzureBlobStorage::initialize(size_t attempt)
     if (initialized)
         return;
 
-    Azure::Storage::Blobs::DownloadBlobOptions download_options;
-
-    Azure::Nullable<int64_t> length {};
-    if (read_until_position != 0)
-        length = {static_cast<int64_t>(read_until_position - offset)};
-
-    download_options.Range = {static_cast<int64_t>(offset), length};
-
     ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::ReadBufferFromAzureInitMicroseconds);
 
-    /// The SDK retry-context attempt is the OUTER attempt (from `nextImpl`'s
-    /// retry loop), fixed across this initialize() call's inner retries —
-    /// matches pre-refactor behaviour where `azure_context` was built once
-    /// from `attempt` before the inner loop. The wrapper method below
-    /// records BlobStorageLog `Read` events and the
-    /// `ReadBufferFromAzureRequestsErrors` counter on every attempt.
-    auto download_response = AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow(
-        log, path, max_single_download_retries,
-        [&](size_t /*inner_attempt*/)
-        {
-            return blob_container_client->downloadBlobBodyStreamWithAttemptContext(
-                path, download_options, /* outer attempt */ attempt,
-                blob_storage_log, container_for_logging,
-                /* length_or_zero_for_failure_logging */
-                length.HasValue() ? static_cast<size_t>(length.Value()) : 0);
-        });
+    auto download_response = blob_container_client->downloadBlobBodyStreamWithAttemptContextAndAutoRetry(
+        path,
+        /* range_offset */ static_cast<size_t>(offset),
+        /* range_length_or_zero */ read_until_position != 0 ? read_until_position - offset : 0,
+        /* outer_attempt */ attempt,
+        max_single_download_retries, log,
+        blob_storage_log, container_for_logging);
 
     setMetadataFromResponse(download_response.Value.Details, download_response.Value.BlobSize);
     data_stream = std::move(download_response.Value.BodyStream);
@@ -280,18 +263,13 @@ size_t ReadBufferFromAzureBlobStorage::readBigAt(char * to, size_t n, size_t ran
     while (n > 0)
     {
         size_t bytes_copied = 0;
-        Azure::Storage::Blobs::DownloadBlobOptions download_options;
-        download_options.Range = {static_cast<int64_t>(range_begin), n};
 
-        /// The wrapper method records BlobStorageLog `Read` events and the
-        /// `ReadBufferFromAzureRequestsErrors` counter on every attempt.
-        auto download_response = AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow(
-            log, path, max_single_download_retries,
-            [&](size_t /*attempt*/)
-            {
-                return blob_container_client->downloadBlobBodyStreamForReadBigAt(
-                    path, download_options, blob_storage_log, container_for_logging, n);
-            });
+        auto download_response = blob_container_client->downloadBlobBodyStreamForReadBigAtAndAutoRetry(
+            path,
+            /* range_offset */ range_begin,
+            /* range_length */ n,
+            max_single_download_retries, log,
+            blob_storage_log, container_for_logging);
 
         setMetadataFromResponse(download_response.Value.Details, download_response.Value.BlobSize);
 

@@ -248,6 +248,11 @@ void calculateHashTableCacheKeys(
             /// the join result's cardinality, so it doesn't affect the collected output bytes.)
             frame.hash.update(static_cast<uint8_t>(kind));
             frame.hash.update(static_cast<uint8_t>(table_join.strictness()));
+            /// For ASOF the inequality (`<`, `<=`, `>`, `>=`) is part of the join semantics: it
+            /// changes which rows match and thus the output, so the same inputs under different
+            /// inequalities must not share collected statistics.
+            if (table_join.strictness() == JoinStrictness::Asof)
+                frame.hash.update(static_cast<uint8_t>(table_join.getAsofInequality()));
             frame.hash.update(table_join.joinUseNulls());
             if (const auto & mixed = table_join.getMixedJoinExpression())
                 mixed->getActionsDAG().updateHash(frame.hash);

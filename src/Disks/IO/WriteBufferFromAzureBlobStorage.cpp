@@ -117,8 +117,11 @@ void WriteBufferFromAzureBlobStorage::preFinalize()
         if (detached_part_data.size() == 1 && detached_part_data.front().data_size <= max_single_part_upload_size)
         {
             auto part_data = std::move(detached_part_data.front());
-            blob_container_client->uploadSinglePartWithAccessConditionsAndIOWriteSchedulingAndAutoRetry(
-                blob_path, part_data, write_settings,
+            blob_container_client->uploadSinglePart(
+                blob_path,
+                reinterpret_cast<const uint8_t *>(part_data.memory.data()),
+                part_data.data_size,
+                &write_settings,
                 max_unexpected_write_error_retries, log,
                 blob_log, container_for_logging);
             LOG_TRACE(limited_log, "Committed single block for blob `{}`", blob_path);
@@ -128,8 +131,9 @@ void WriteBufferFromAzureBlobStorage::preFinalize()
         /// Upload a single empty block
         else if (detached_part_data.empty())
         {
-            blob_container_client->uploadSinglePartWithAccessConditionsAndIOWriteSchedulingAndAutoRetry(
-                blob_path, AzureBlobStorage::UploadPartData{}, write_settings,
+            blob_container_client->uploadSinglePart(
+                blob_path, /* data */ nullptr, /* data_size */ 0,
+                &write_settings,
                 max_unexpected_write_error_retries, log,
                 blob_log, container_for_logging);
             LOG_TRACE(log, "Committed single empty block for blob `{}`", blob_path);
@@ -154,8 +158,8 @@ void WriteBufferFromAzureBlobStorage::finalizeImpl()
 
     if (!block_ids.empty())
     {
-        blob_container_client->commitBlockListWithAccessConditionsAndAutoRetry(
-            blob_path, block_ids, write_settings,
+        blob_container_client->commitBlockList(
+            blob_path, block_ids, &write_settings,
             max_unexpected_write_error_retries, log,
             blob_log, container_for_logging);
         LOG_TRACE(limited_log, "Committed {} blocks for blob `{}`", block_ids.size(), blob_path);
@@ -165,7 +169,7 @@ void WriteBufferFromAzureBlobStorage::finalizeImpl()
     {
         try
         {
-            blob_container_client->getBlobPropertiesForUploadVerification(blob_path);
+            blob_container_client->GetBlobProperties(blob_path);
         }
         catch (const Azure::Storage::StorageException & e)
         {
@@ -174,6 +178,7 @@ void WriteBufferFromAzureBlobStorage::finalizeImpl()
                         ErrorCodes::AZURE_BLOB_STORAGE_ERROR,
                         "Object {} not uploaded to azure blob storage, it's a bug in Azure Blob Storage or its API.",
                         blob_path);
+            /// TODO: is this one needed? is rethrowAzureException actually needed?
             rethrowAzureException(e, blob_path);
         }
     }
@@ -288,8 +293,11 @@ void WriteBufferFromAzureBlobStorage::writePart(WriteBufferFromAzureBlobStorage:
         const auto & data_block_id = std::get<0>(*worker_data);
         const auto & worker_part_data = std::get<1>(*worker_data);
 
-        blob_container_client->stageBlockWithIOWriteSchedulingAndAutoRetry(
-            blob_path, data_block_id, worker_part_data, write_settings,
+        blob_container_client->stageBlock(
+            blob_path, data_block_id,
+            reinterpret_cast<const uint8_t *>(worker_part_data.memory.data()),
+            worker_part_data.data_size,
+            &write_settings,
             max_unexpected_write_error_retries, log,
             blob_log, container_for_logging);
     };

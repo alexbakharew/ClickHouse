@@ -222,13 +222,13 @@ void ReadBufferFromAzureBlobStorage::initialize(size_t attempt)
 
     ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::ReadBufferFromAzureInitMicroseconds);
 
-    auto download_response = blob_container_client->downloadBlobBodyStreamWithAttemptContextAndAutoRetry(
+    auto download_response = blob_container_client->downloadRange(
         path,
         /* range_offset */ static_cast<size_t>(offset),
-        /* range_length_or_zero */ read_until_position != 0 ? read_until_position - offset : 0,
-        /* outer_attempt */ attempt,
+        /* range_length */ read_until_position != 0 ? read_until_position - offset : 0,
         max_single_download_retries, log,
-        blob_storage_log, container_for_logging);
+        blob_storage_log, container_for_logging,
+        /* outer_attempt */ attempt);
 
     setMetadataFromResponse(download_response.Value.Details, download_response.Value.BlobSize);
     data_stream = std::move(download_response.Value.BodyStream);
@@ -244,14 +244,14 @@ void ReadBufferFromAzureBlobStorage::initialize(size_t attempt)
 std::optional<size_t> ReadBufferFromAzureBlobStorage::tryGetFileSize()
 {
     if (!file_size)
-        file_size = blob_container_client->getBlobPropertiesForSizeOnly(path).Value.BlobSize;
+        file_size = blob_container_client->GetBlobProperties(path).Value.BlobSize;
 
     return file_size;
 }
 
 std::optional<size_t> ReadBufferFromAzureBlobStorage::getRemoteFileSize() const
 {
-    return static_cast<size_t>(blob_container_client->getBlobPropertiesForSizeOnly(path).Value.BlobSize);
+    return static_cast<size_t>(blob_container_client->GetBlobProperties(path).Value.BlobSize);
 }
 
 size_t ReadBufferFromAzureBlobStorage::readBigAt(char * to, size_t n, size_t range_begin, const std::function<bool(size_t)> & /*progress_callback*/) const
@@ -264,7 +264,7 @@ size_t ReadBufferFromAzureBlobStorage::readBigAt(char * to, size_t n, size_t ran
     {
         size_t bytes_copied = 0;
 
-        auto download_response = blob_container_client->downloadBlobBodyStreamForReadBigAtAndAutoRetry(
+        auto download_response = blob_container_client->downloadRange(
             path,
             /* range_offset */ range_begin,
             /* range_length */ n,

@@ -177,16 +177,22 @@ namespace
                 copyData(*read_buffer, wb, total_size);
             }
 
-            Azure::Core::IO::MemoryBodyStream stream(reinterpret_cast<const uint8_t *>(memory.data()), total_size);
-
-            client->uploadSinglePartForCopyWithBlobStorageLog(
-                dest_blob, stream, blob_storage_log, dest_container_for_logging, total_size);
+            client->uploadSinglePart(
+                dest_blob,
+                reinterpret_cast<const uint8_t *>(memory.data()),
+                total_size,
+                /* write_settings */ nullptr,   // copy path: no AccessConditions, no ResourceGuard
+                /* num_tries     */ 1,          // copy path: no retry
+                log, blob_storage_log, dest_container_for_logging);
         }
 
         void completeMultipartUpload()
         {
-            client->commitBlockListForCopyWithBlobStorageLog(
-                dest_blob, block_ids, blob_storage_log, dest_container_for_logging);
+            client->commitBlockList(
+                dest_blob, block_ids,
+                /* write_settings */ nullptr,
+                /* num_tries     */ 1,
+                log, blob_storage_log, dest_container_for_logging);
         }
 
         void performMultipartUpload()
@@ -306,13 +312,15 @@ namespace
                 copyData(*read_buffer, wb, size_to_stage);
             }
 
-            Azure::Core::IO::MemoryBodyStream stream(reinterpret_cast<const uint8_t *>(memory.data()), size_to_stage);
-
             const auto & block_id = task.block_ids.emplace_back(getRandomASCIIString(64));
 
-            client->stageBlockForCopyWithBlobStorageLog(
-                dest_blob, block_id, stream,
-                blob_storage_log, dest_container_for_logging, size_to_stage);
+            client->stageBlock(
+                dest_blob, block_id,
+                reinterpret_cast<const uint8_t *>(memory.data()),
+                size_to_stage,
+                /* write_settings */ nullptr,
+                /* num_tries     */ 1,
+                log, blob_storage_log, dest_container_for_logging);
 
             LOG_TRACE(log, "Writing part. Container: {}, Blob: {}, block_id: {}, size: {}",
                       dest_container_for_logging, dest_blob, block_id, size_to_stage);
@@ -381,7 +389,7 @@ void copyAzureBlobStorageFile(
 
         try
         {
-            auto source_uri = src_client->getBlobUrlForServerSideCopy(src_blob);
+            auto source_uri = src_client->GetBlobUrl(src_blob);
 
             if (size < settings->max_single_part_copy_size)
             {
@@ -393,7 +401,7 @@ void copyAzureBlobStorageFile(
                 }
 
                 LOG_TRACE(log, "Copy blob sync {} -> {}", src_blob, dest_blob);
-                dest_client->copyBlobFromUriSync(dest_blob, source_uri, copy_options);
+                dest_client->copyBlobFromUri(dest_blob, source_uri, copy_options);
             }
             else
             {
@@ -404,7 +412,7 @@ void copyAzureBlobStorageFile(
                         copy_options.Metadata[key] = value;
                 }
 
-                Azure::Storage::Blobs::StartBlobCopyOperation operation = dest_client->copyBlobFromUriAsync(dest_blob, source_uri, copy_options);
+                Azure::Storage::Blobs::StartBlobCopyOperation operation = dest_client->copyBlobFromUri(dest_blob, source_uri, copy_options);
 
                 /// NOTE: `PollUntilDone` and `IsDone` are SDK calls on the async-copy
                 /// operation handle returned above. They poll the same blob endpoint

@@ -74,7 +74,7 @@ private:
     bool getBatchAndCheckNext(RelativePathsWithMetadata & batch) override
     {
         chassert(batch.empty());
-        auto blob_list_response = client->listBlobsPagedWithPrefixAdjustment(options);
+        auto blob_list_response = client->ListBlobs(options);
         auto blobs_list = blob_list_response.Blobs;
         batch.reserve(blobs_list.size());
 
@@ -138,7 +138,7 @@ bool AzureObjectStorage::exists(const StoredObject & object) const
     auto client_ptr = client.get();
     try
     {
-        client_ptr->getBlobPropertiesForExistenceCheck(object.remote_path);
+        client_ptr->GetBlobProperties(object.remote_path);
         return true;
     }
     catch (const Azure::Storage::StorageException & e)
@@ -173,7 +173,7 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
     else
         options.PageSizeHint = settings.get()->list_object_keys_size;
 
-    for (auto blob_list_response = client_ptr->listBlobsPagedWithPrefixAdjustment(options); blob_list_response.HasPage(); blob_list_response.MoveToNextPage())
+    for (auto blob_list_response = client_ptr->ListBlobs(options); blob_list_response.HasPage(); blob_list_response.MoveToNextPage())
     {
         const auto & blobs_list = blob_list_response.Blobs;
 
@@ -398,7 +398,7 @@ static void setAzureBlobTag(
 {
     auto log = getLogger("setAzureBlobTag");
     for (const auto & blob_name : blob_names)
-        client_ptr->updateSingleBlobTagIfDifferentWithRethrow(blob_name, tag_key, tag_value, log);
+        client_ptr->UpdateBlobTag(blob_name, tag_key, tag_value, log);
 }
 
 void AzureObjectStorage::tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value)
@@ -411,7 +411,7 @@ void AzureObjectStorage::tagObjects(const StoredObjects & objects, const std::st
 ObjectMetadata AzureObjectStorage::getObjectMetadata(const std::string & path, bool) const
 {
     auto client_ptr = client.get();
-    auto properties = client_ptr->getBlobPropertiesForMetadataWithRethrow(path).Value;
+    auto properties = client_ptr->GetBlobProperties(path).Value;
 
     ObjectMetadata result;
     result.size_bytes = properties.BlobSize;

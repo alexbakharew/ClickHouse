@@ -287,7 +287,7 @@ void considerEnablingParallelReplicas(
     // but only for those that we will actually instrument (see `setRuntimeDataflowStatisticsCacheUpdater` calls below).
     // However, currently only relatively simple plans are supported (no UNIONs, etc.),
     // since such steps obviously don't support statistics collection, `supportsDataflowStatisticsCollection` is handy to check if the plan is simple enough.
-    // `JoinStep`, `BuildRuntimeFilterStep`, and `*CreatingSetsStep` don't collect statistics themselves but always appear below the instrumented top node,
+    // `BuildRuntimeFilterStep`, and `*CreatingSetsStep` don't collect statistics themselves but always appear below the instrumented top node,
     // so they are allowed to pass through the check.
     bool plan_is_simple_enough = true;
     traverseQueryPlan(
@@ -296,7 +296,7 @@ void considerEnablingParallelReplicas(
         [&](auto & frame_node)
         {
             plan_is_simple_enough &= frame_node.step->supportsDataflowStatisticsCollection()
-                || isOneOf<JoinStep, BuildRuntimeFilterStep, DelayedCreatingSetsStep, CreatingSetsStep>(frame_node.step.get());
+                || isOneOf<BuildRuntimeFilterStep, DelayedCreatingSetsStep, CreatingSetsStep>(frame_node.step.get());
         });
     if (!plan_is_simple_enough)
     {

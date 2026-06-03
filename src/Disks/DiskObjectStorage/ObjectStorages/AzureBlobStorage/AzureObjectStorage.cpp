@@ -73,8 +73,6 @@ public:
 private:
     bool getBatchAndCheckNext(RelativePathsWithMetadata & batch) override
     {
-        client->traceAzureListObjects();
-
         chassert(batch.empty());
         auto blob_list_response = client->listBlobsPagedWithPrefixAdjustment(options);
         auto blobs_list = blob_list_response.Blobs;
@@ -177,9 +175,6 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
 
     for (auto blob_list_response = client_ptr->listBlobsPagedWithPrefixAdjustment(options); blob_list_response.HasPage(); blob_list_response.MoveToNextPage())
     {
-        /// One trace per page-request (initial ListBlobs + each MoveToNextPage).
-        client_ptr->traceAzureListObjects();
-
         const auto & blobs_list = blob_list_response.Blobs;
 
         for (const auto & blob : blobs_list)
@@ -471,7 +466,6 @@ void AzureObjectStorage::copyObject( /// NOLINT
     auto client_ptr = client.get();
     auto object_metadata = getObjectMetadata(object_from.remote_path, false);
 
-    client_ptr->traceAzureCopyObject();
     LOG_TRACE(log, "AzureObjectStorage::copyObject of size {}", object_metadata.size_bytes);
 
     auto scheduler = threadPoolCallbackRunnerUnsafe<void>(getThreadPoolWriter(), ThreadName::AZURE_COPY_POOL);

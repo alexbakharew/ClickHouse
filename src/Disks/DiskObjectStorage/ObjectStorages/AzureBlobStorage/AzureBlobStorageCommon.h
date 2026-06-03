@@ -121,26 +121,9 @@ using BlobContainerPropertiesRespones = Azure::Response<Azure::Storage::Blobs::M
 using BlobBatchResultResponse = Azure::Response<Azure::Storage::Blobs::Models::SubmitBlobBatchResult>;
 using DeleteBlobResultDeferredResponse = Azure::Storage::DeferredResponse<Azure::Storage::Blobs::Models::DeleteBlobResult>;
 
-/// A wrapper for ContainerClient that correctly handles the prefix of blobs.
-/// See AzureBlobStorageEndpoint and processAzureBlobStorageEndpoint for details.
-///
-/// This wrapper is the single chokepoint for every Azure SDK call in the
-/// ClickHouse Azure object-storage layer. Callers should NOT acquire raw
-/// `BlobClient`/`BlockBlobClient` objects and operate on them directly —
-/// use the named data-plane methods below (`uploadSinglePartWith…`,
-/// `downloadBlobBodyStream…`, `deleteBlobSingleWith…` etc.).
-///
-/// Common boilerplate (profile-event increments paired with their DiskAzure
-/// counterparts, BlobStorageLog event recording with the Stopwatch +
-/// error_code + error_message triplet) is absorbed into the helper methods
-/// in the "Universal helpers" section, so call sites stay thin.
-///
-/// Retry policy currently lives at the call sites (see
-/// `WriteBufferFromAzureBlobStorage::execWithRetry` and the inline retry
-/// loops in `ReadBufferFromAzureBlobStorage`). Wrapper methods are
-/// non-retrying: they do exactly one SDK call, log success or failure into
-/// BlobStorageLog, and rethrow on failure. T1 (unified retry helper) is a
-/// follow-up that can later absorb the retry into the wrapper itself.
+/// This wrapper is the single entry point to Azure SDK.
+/// .Callers should NOT acquire raw `BlobClient`/`BlockBlobClient` objects —
+/// use the named data-plane methods below or add new ones.
 class ContainerClientWrapper
 {
 public:
@@ -158,44 +141,6 @@ public:
     BlobBatchResultResponse SubmitBatch(const BlobContainerBatch & batch) const;
     String GetBlobPath(const String & blob_name) const;
 
-    /// === Universal tracing helpers (ProfileEvents pairs) ===
-    ///
-    /// Each `traceAzure<Op>` increments the generic `Azure<Op>` event, and
-    /// additionally the `DiskAzure<Op>` counterpart when `IsClientForDisk()`
-    /// returns true. Replaces the copy-pasted pair at every call site.
-
-    void traceAzureListObjects(size_t count = 1) const;
-    void traceAzureGetProperties() const;
-    void traceAzureDeleteObjects(size_t count = 1) const;
-    void traceAzureUpload() const;
-    void traceAzureStageBlock() const;
-    void traceAzureCommitBlockList() const;
-    void traceAzureCopyObject() const;
-    void traceAzureGetObject() const;
-
-    /// === Universal BlobStorageLog helpers ===
-    ///
-    /// These replace the `Stopwatch + error_code + error_message +
-    /// blob_log->addEvent(...)` triplet that was hand-rolled at every SDK
-    /// call site. They are no-ops if `blob_log` is nullptr.
-
-    static void logBlobStorageEventOnSuccess(
-        const BlobStorageLogWriterPtr & blob_log,
-        BlobStorageLogElement::EventType event_type,
-        const String & container_for_logging,
-        const String & blob_path_for_logging,
-        size_t data_size,
-        UInt64 elapsed_microseconds);
-
-    static void logBlobStorageEventOnFailure(
-        const BlobStorageLogWriterPtr & blob_log,
-        BlobStorageLogElement::EventType event_type,
-        const String & container_for_logging,
-        const String & blob_path_for_logging,
-        size_t data_size,
-        UInt64 elapsed_microseconds,
-        Int32 status_code,
-        const String & error_message);
 
     /// === Generic error/retry primitives (T1 + Option A) ===
     ///
@@ -422,7 +367,52 @@ public:
         const String & source_uri,
         const Azure::Storage::Blobs::StartBlobCopyFromUriOptions & options) const;
 
+
+    /// TODO: comment, explain why it's public (batch ops are controlled from outside)
+    void traceAzureDeleteObjects(size_t count = 1) const;
+
 private:
+    /// === Universal tracing helpers (ProfileEvents pairs) ===
+    ///
+    /// Each `traceAzure<Op>` increments the generic `Azure<Op>` event, and
+    /// additionally the `DiskAzure<Op>` counterpart when `IsClientForDisk()`
+    /// returns true. Replaces the copy-pasted pair at every call site.
+
+    void traceAzureListObjects(size_t count = 1) const;
+    void traceAzureCopyObject() const;
+    void traceAzureGetProperties() const;
+    void traceAzureUpload() const;
+    void traceAzureStageBlock() const;
+    void traceAzureCommitBlockList() const;
+    void traceAzureGetObject() const;
+
+    /// === Universal BlobStorageLog helpers ===
+    ///
+    /// These replace the `Stopwatch + error_code + error_message +
+    /// blob_log->addEvent(...)` triplet that was hand-rolled at every SDK
+    /// call site. They are no-ops if `blob_log` is nullptr.
+
+    static void logBlobStorageEventOnSuccess(
+        const BlobStorageLogWriterPtr & blob_log,
+        BlobStorageLogElement::EventType event_type,
+        const String & container_for_logging,
+        const String & blob_path_for_logging,
+        size_t data_size,
+        UInt64 elapsed_microseconds);
+
+    static void logBlobStorageEventOnFailure(
+        const BlobStorageLogWriterPtr & blob_log,
+        BlobStorageLogElement::EventType event_type,
+        const String & container_for_logging,
+        const String & blob_path_for_logging,
+        size_t data_size,
+        UInt64 elapsed_microseconds,
+        Int32 status_code,
+        const String & error_message);
+
+
+
+
     RawContainerClient client;
     String blob_prefix;
 };

@@ -97,11 +97,6 @@ WriteBufferFromAzureBlobStorage::~WriteBufferFromAzureBlobStorage()
     task_tracker->safeWaitAll();
 }
 
-/// `execWithRetry` was the WriteBuffer-local retry helper. It is now replaced
-/// by `AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow`,
-/// which is shared with ReadBuffer's retry sites. The four upload/stage/
-/// commit sites below construct their own ResourceGuard inside the lambda.
-
 void WriteBufferFromAzureBlobStorage::preFinalize()
 {
     if (is_prefinalized)

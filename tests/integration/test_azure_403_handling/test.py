@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for Azure 403 / PATH_ACCESS_DENIED handling."""
+"""Tests for Azure 403 / AZURE_ACCESS_DENIED handling."""
 import os
 
 import pytest
@@ -81,7 +81,7 @@ def test_sanity_check(started_cluster):
     assert files == ["basic.csv"]
 
 
-def test_injected_403_surfaces_as_path_access_denied(started_cluster):
+def test_azure_403_converts_to_access_denied(started_cluster):
     endpoint = started_cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]
 
     _create_table(endpoint, "t_403", "failpoint.csv")
@@ -97,14 +97,14 @@ def test_injected_403_surfaces_as_path_access_denied(started_cluster):
     node.query("SYSTEM ENABLE FAILPOINT azure_inject_forbidden_response")
     try:
         err = node.query_and_get_error("SELECT count() FROM t_403")
-        assert "PATH_ACCESS_DENIED" in err, f"expected PATH_ACCESS_DENIED, got:\n{err}"
+        assert "AZURE_ACCESS_DENIED" in err, f"expected AZURE_ACCESS_DENIED, got:\n{err}"
     finally:
         node.query("SYSTEM DISABLE FAILPOINT azure_inject_forbidden_response")
 
 
-def test_403_during_merge_surfaces_as_path_access_denied(started_cluster):
+def test_azure_403_at_merge_converts_to_access_denied(started_cluster):
     # Real-life scenario - failure during a background merge while reading parts from Azure.
-    # Asserts the resulting error is PATH_ACCESS_DENIED and NOT POTENTIALLY_BROKEN_DATA_PART.
+    # Asserts the resulting error is AZURE_ACCESS_DENIED and NOT POTENTIALLY_BROKEN_DATA_PART.
     node.query(
         """
         CREATE TABLE t_merge (k UInt64, v String)
@@ -124,7 +124,7 @@ def test_403_during_merge_surfaces_as_path_access_denied(started_cluster):
     node.query("SYSTEM ENABLE FAILPOINT azure_inject_forbidden_response")
     try:
         err = node.query_and_get_error("OPTIMIZE TABLE t_merge FINAL")
-        assert "PATH_ACCESS_DENIED" in err, f"expected PATH_ACCESS_DENIED, got:\n{err}"
+        assert "AZURE_ACCESS_DENIED" in err, f"expected AZURE_ACCESS_DENIED, got:\n{err}"
         assert "POTENTIALLY_BROKEN_DATA_PART" not in err, (
             f"unexpected broken-part error:\n{err}"
         )

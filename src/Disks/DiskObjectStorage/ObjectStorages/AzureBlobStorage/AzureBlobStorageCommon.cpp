@@ -331,8 +331,7 @@ void ContainerClientWrapper::logBlobStorageEventOnFailure(
 
 BlobContainerPropertiesRespones ContainerClientWrapper::getContainerPropertiesForExistenceCheck() const
 {
-    /// Tracing is the caller's responsibility (containerExists has special
-    /// handling for InternalServerError that wants to log on the same path).
+    traceAzureGetProperties();
     return client.GetProperties();
 }
 
@@ -340,6 +339,7 @@ ListBlobsPagedResponse ContainerClientWrapper::listBlobsPagedWithPrefixAdjustmen
 {
     /// Reuses the existing prefix-aware ListBlobs(); kept as a separate
     /// method for naming-clarity so call sites read uniformly.
+    traceAzureListObjects();
     return ListBlobs(options);
 }
 
@@ -736,6 +736,8 @@ ContainerClientWrapper::copyBlobFromUriSync(
     const String & source_uri,
     const Azure::Storage::Blobs::CopyBlobFromUriOptions & options) const
 {
+    /// TODO: please double check the fix of stat double increment (see AzureObjectStorage::copyObject and copyAzureBlobStorageFile
+    traceAzureCopyObject();
     return client.GetBlockBlobClient(blob_prefix + dest_blob_name).CopyFromUri(source_uri, options);
 }
 
@@ -744,6 +746,8 @@ Azure::Storage::Blobs::StartBlobCopyOperation ContainerClientWrapper::copyBlobFr
     const String & source_uri,
     const Azure::Storage::Blobs::StartBlobCopyFromUriOptions & options) const
 {
+    /// TODO: please double check the fix of stat double increment (see AzureObjectStorage::copyObject and copyAzureBlobStorageFile
+    traceAzureCopyObject();
     return client.GetBlockBlobClient(blob_prefix + dest_blob_name).StartCopyFromUri(source_uri, options);
 }
 
@@ -754,6 +758,7 @@ Azure::Storage::Blobs::StartBlobCopyOperation ContainerClientWrapper::copyBlobFr
 /// getCurrentExceptionMessageAndPattern, which catches std::logic_error and calls
 /// abortOnFailedAssertion in debug/sanitizer builds — turning a user typo into a
 /// "Logical error" abort.
+/// TODO: rename & simplify
 [[noreturn]] static void translateAzureSdkParseError(const std::logic_error & e)
 {
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -855,7 +860,6 @@ void processURL(const String & url, const String & container_name, Endpoint & en
 
 static bool containerExists(const ContainerClient & client)
 {
-    client.traceAzureGetProperties();
     try
     {
         client.getContainerPropertiesForExistenceCheck();

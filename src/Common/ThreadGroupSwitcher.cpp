@@ -55,6 +55,24 @@ ThreadGroupSwitcher::ThreadGroupSwitcher(ThreadGroupPtr thread_group_, ThreadNam
     {
         /// Unexpected. For caller's convenience avoid throwing exceptions.
         DB::tryLogCurrentException(__PRETTY_FUNCTION__);
+        /// For the allow_existing_group=true path the constructor detached from
+        /// prev_thread_group before calling attachToGroupImpl. If that attach failed,
+        /// the SCOPE_EXIT_SAFE in attachToGroupImpl already cleaned up the partial
+        /// attachment to the new group. Try to restore the original group so the
+        /// caller does not continue with no thread-group context (broken accounting
+        /// and cancellation). Log and swallow any failure in the restore itself.
+        if (prev_thread_group && !CurrentThread::getGroup())
+        {
+            try
+            {
+                LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
+                CurrentThread::attachToGroup(prev_thread_group);
+            }
+            catch (...)
+            {
+                DB::tryLogCurrentException(__PRETTY_FUNCTION__);
+            }
+        }
         thread_group = nullptr;
         prev_thread_group = nullptr;
     }

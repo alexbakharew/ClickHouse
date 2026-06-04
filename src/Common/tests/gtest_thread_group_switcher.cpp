@@ -150,4 +150,56 @@ TEST(ThreadGroupSwitcher, LinkThreadFailureDoesNotCorruptCounter)
            "thread clean for the next attachment";
 }
 
+/// When allow_existing_group=true is used and the new attachment fails, the constructor
+/// must restore the original group (G0) so the caller does not lose query/merge
+/// accounting and cancellation context.
+TEST(ThreadGroupSwitcher, AllowExistingGroupRestoresOnFailure)
+{
+    auto context = getContext().context;
+
+    std::exception_ptr ex;
+    bool original_group_restored = false;
+
+    std::thread t([&]
+    {
+        try
+        {
+            ThreadStatus ts;
+
+            auto G0 = std::make_shared<ThreadGroup>(context, 0);
+            auto G1 = std::make_shared<ThreadGroup>(context, 0);
+
+            /// Start attached to G0 (simulates a merge/pipeline thread already inside a group).
+            CurrentThread::attachToGroupIfDetached(G0);
+            ASSERT_EQ(getCurrentThreadGroup(), G0);
+
+            FailPointInjection::enableFailPoint(FailPoints::thread_group_switcher_attach_failure);
+
+            {
+                /// allow_existing_group=true: constructor detaches from G0, then
+                /// attachToGroupImpl throws (failpoint). SCOPE_EXIT cleans up G1.
+                /// Catch block must restore G0 so the thread is not left without context.
+                ThreadGroupSwitcher switcher(G1, ThreadName::MERGE_MUTATE, /*allow_existing_group*/ true);
+            }
+
+            original_group_restored = (getCurrentThreadGroup() == G0);
+
+            /// Clean up.
+            CurrentThread::detachFromGroupIfNotDetached();
+        }
+        catch (...)
+        {
+            ex = std::current_exception();
+        }
+    });
+    t.join();
+
+    if (ex)
+        std::rethrow_exception(ex);
+
+    EXPECT_TRUE(original_group_restored)
+        << "Failed allow_existing_group switch must restore the original group; "
+           "without the fix the thread loses its query/merge accounting context";
+}
+
 } // namespace DB

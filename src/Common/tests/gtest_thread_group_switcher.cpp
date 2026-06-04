@@ -22,24 +22,25 @@ namespace FailPoints
 /// Regression test for https://github.com/ClickHouse/clickhouse-core-incidents/issues/1682
 ///
 /// Root cause (confirmed from stack traces):
-///   TasksStatsCounters::reset() inside initPerformanceCounters() doesn't have
+///   In 26.4, TasksStatsCounters::reset() inside initPerformanceCounters() had no
 ///   try/catch. When /proc/thread-self/schedstat returned errno=9 (EBADF), the
-///   ErrnoException propagated to the ThreadGroupSwitcher constructor's noexcept catch
-///   block. That block cleared switcher.thread_group but left ThreadStatus::thread_group
-///   set to the group that was assigned earlier in attachToGroupImpl(). The pool worker
-///   thread stayed attached to the stale group, so every subsequent ThreadGroupSwitcher
-///   on that thread threw LOGICAL_ERROR:
+///   ErrnoException escaped initPerformanceCounters and propagated up through
+///   attachToGroupImpl into the ThreadGroupSwitcher constructor's noexcept catch block.
+///   By that point all context fields (performance_counters parent, memory_tracker
+///   parent, query_context, local_data, …) were already pointing at the thread group.
+///   The catch block logged the error but left ThreadStatus fully attached to the stale
+///   group, so every subsequent task on that pool worker threw LOGICAL_ERROR:
 ///     "Thread (REMOTE_FS_READ_THREAD_POOL) is already attached to a group (master_thread_id 1398)"
 ///
-/// The failpoint thread_group_switcher_attach_failure fires inside attachToGroupImpl()
-/// right after `thread_group = thread_group_`, reproducing the exact failure window.
+/// Fix: attachToGroupImpl now installs a SCOPE_EXIT_SAFE guard that calls
+/// detachFromGroup() on failure, undoing the full attachment (unlinkThread, all parent
+/// pointers, query_context, local_data, etc.). ThreadGroupSwitcher's catch block is
+/// unchanged — it just clears its own members; the ThreadStatus is already clean.
 ///
-/// Fix: the constructor catch block now checks whether ThreadStatus is partially
-/// attached to our group and calls detachFromGroupIfNotDetached() to undo it.
-///
-/// NOTE: ThreadGroupSwitcher::ThreadGroupSwitcher is noexcept. It has an internal
-/// catch-all that swallows all exceptions (including the injected failpoint one) and
-/// logs them.
+/// The failpoint thread_group_switcher_attach_failure fires after all context fields
+/// are set but before initPerformanceCounters, matching the 26.4 failure window.
+/// ThreadGroupSwitcher::ThreadGroupSwitcher is noexcept — the injected exception is
+/// swallowed internally and never reaches the test.
 TEST(ThreadGroupSwitcher, PartialAttachUndoneOnException)
 {
     auto context = getContext().context;
@@ -56,18 +57,17 @@ TEST(ThreadGroupSwitcher, PartialAttachUndoneOnException)
             auto G1 = std::make_shared<ThreadGroup>(context, 0);
             auto G2 = std::make_shared<ThreadGroup>(context, 0);
 
-            /// Enable the failpoint: the next attachToGroupImpl() call will throw after
-            /// setting ThreadStatus::thread_group, simulating the failure path.
+            /// Enable the failpoint: attachToGroupImpl() will throw after all context
+            /// fields are set (performance_counters parent, memory_tracker parent,
+            /// query_context, local_data, …) but before initPerformanceCounters,
+            /// matching the 26.4 failure window.
             FailPointInjection::enableFailPoint(FailPoints::thread_group_switcher_attach_failure);
 
             {
-                /// The constructor catches the injected exception internally (noexcept).
-                /// Before the fix: ThreadStatus::thread_group stays set to G1 → stale.
-                /// After  the fix: catch block detects partial attachment and undoes it.
+                /// ThreadGroupSwitcher is noexcept — the injected exception is caught
+                /// and logged internally. The SCOPE_EXIT_SAFE guard in attachToGroupImpl
+                /// calls detachFromGroup() to undo the full attachment before returning.
                 ThreadGroupSwitcher switcher(G1, ThreadName::REMOTE_FS_READ_THREAD_POOL);
-
-                /// The constructor never throws — the exception was swallowed above.
-                /// With the fix, the thread is already detached here.
             }
 
             /// Failpoint is ONCE — already consumed, no need to disable.

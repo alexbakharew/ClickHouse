@@ -17,6 +17,7 @@
 #include <Common/CurrentThread.h>
 #include <Common/DateLUT.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
 #include <Common/QueryProfiler.h>
@@ -39,6 +40,11 @@
 
 namespace DB
 {
+namespace FailPoints
+{
+    extern const char thread_group_switcher_attach_failure[];
+}
+
 namespace Setting
 {
     extern const SettingsBool calculate_text_stack_trace;
@@ -74,6 +80,7 @@ namespace ServerSetting
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int FAULT_INJECTED;
 }
 
 void configureMemoryTrackerFromSettings(bool has_trace_collector, MemoryTracker & memory_tracker, const Settings & settings)
@@ -353,6 +360,15 @@ void ThreadStatus::attachToGroupImpl(const ThreadGroupPtr & thread_group_)
     /// Attach or init current thread to thread group and copy useful information from it
     thread_group = thread_group_;
     thread_group->linkThread(thread_id);
+
+    /// Failpoint to simulate an exception thrown after thread_group is set but before
+    /// attachToGroupImpl returns — reproduces the exact failure path from
+    /// https://github.com/ClickHouse/clickhouse-core-incidents/issues/1682 where
+    /// TasksStatsCounters::reset() threw without a try/catch.
+    fiu_do_on(FailPoints::thread_group_switcher_attach_failure,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure in attachToGroupImpl after thread_group set");
+    });
 
     performance_counters.setParent(&thread_group->performance_counters);
     memory_tracker.setParent(&thread_group->memory_tracker);

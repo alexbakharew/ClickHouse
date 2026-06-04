@@ -381,7 +381,7 @@ void copyAzureBlobStorageFile(
     auto log = getLogger("copyAzureBlobStorageFile");
     bool is_native_copy_done = false;
 
-    if (settings->use_native_copy)
+    if (settings->use_native_copy && offset == 0) /// only native copy whole objects
     {
         /// Do native copy
         LOG_TRACE(log, "Copying Blob: {} from Container: {} using native copy", src_blob, src_container_for_logging);
@@ -413,11 +413,12 @@ void copyAzureBlobStorageFile(
 
                 Azure::Storage::Blobs::StartBlobCopyOperation operation = dest_client->copyBlobFromUri(dest_blob, source_uri, copy_options);
 
-                /// NOTE: `PollUntilDone` and `IsDone` are SDK calls on the async-copy
-                /// operation handle returned above. They poll the same blob endpoint
-                /// in a tight loop; wrapping each poll individually would require a
-                /// stateful poll-wrapper class. Left as raw SDK calls.
-                auto copy_response = operation.PollUntilDone(std::chrono::milliseconds(100));
+                auto copy_response = AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow(
+                    nullptr, dest_blob, 1,
+                    [&](size_t)
+                    {
+                        return operation.PollUntilDone(std::chrono::milliseconds(100));
+                    });
                 auto properties_model = copy_response.Value;
 
                 auto copy_status = properties_model.CopyStatus;

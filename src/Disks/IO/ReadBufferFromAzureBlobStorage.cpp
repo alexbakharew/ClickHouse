@@ -29,7 +29,6 @@ namespace ErrorCodes
 {
     extern const int CANNOT_SEEK_THROUGH_FILE;
     extern const int SEEK_POSITION_OUT_OF_BOUND;
-    extern const int RECEIVED_EMPTY_DATA;
     extern const int LOGICAL_ERROR;
     extern const int NOT_INITIALIZED;
 }
@@ -231,10 +230,6 @@ void ReadBufferFromAzureBlobStorage::initialize(size_t attempt)
 
     setMetadataFromResponse(download_response.Value.Details, download_response.Value.BlobSize);
     data_stream = std::move(download_response.Value.BodyStream);
-
-    if (data_stream == nullptr)
-        throw Exception(ErrorCodes::RECEIVED_EMPTY_DATA, "Null data stream obtained while downloading file {} from Blob Storage", path);
-
     total_size = data_stream->Length() + offset;
 
     initialized = true;

@@ -112,6 +112,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
     extern const int AZURE_BLOB_STORAGE_ERROR;
+    extern const int RECEIVED_EMPTY_DATA;
 }
 
 namespace AzureBlobStorage
@@ -239,7 +240,6 @@ String ContainerClientWrapper::GetBlobPath(const String & blob_name) const
     return blob_prefix + blob_name;
 }
 
-// ----- Universal tracing helpers (ProfileEvents pairs) -----------------------
 
 void ContainerClientWrapper::traceAzureListObjects(size_t count) const
 {
@@ -297,7 +297,6 @@ void ContainerClientWrapper::traceAzureGetObject() const
         ProfileEvents::increment(ProfileEvents::DiskAzureGetObject);
 }
 
-// ----- Universal BlobStorageLog helpers --------------------------------------
 
 void ContainerClientWrapper::logBlobStorageEventOnSuccess(
     const BlobStorageLogWriterPtr & blob_log,
@@ -312,13 +311,13 @@ void ContainerClientWrapper::logBlobStorageEventOnSuccess(
         return;
     blob_log->addEvent(
         event_type,
-        /* bucket */ container_for_logging,
-        /* remote_path */ blob_path_for_logging,
-        /* local_path */ local_path_for_logging,
-        /* data_size */ data_size,
+        container_for_logging,
+        blob_path_for_logging,
+        local_path_for_logging,
+        data_size,
         elapsed_microseconds,
-        /* error_code */ 0,
-        /* error_message */ {});
+        0,
+        {});
 }
 
 void ContainerClientWrapper::logBlobStorageEventOnFailure(
@@ -336,10 +335,10 @@ void ContainerClientWrapper::logBlobStorageEventOnFailure(
         return;
     blob_log->addEvent(
         event_type,
-        /* bucket */ container_for_logging,
-        /* remote_path */ blob_path_for_logging,
-        /* local_path */ local_path_for_logging,
-        /* data_size */ data_size,
+        container_for_logging,
+        blob_path_for_logging,
+        local_path_for_logging,
+        data_size,
         elapsed_microseconds,
         status_code,
         error_message);
@@ -355,7 +354,6 @@ void ContainerClientWrapper::applyAccessConditions(
         access_conditions.IfMatch = Azure::ETag(write_settings.object_storage_write_if_match);
 }
 
-// ----- Data-plane wrappers ---------------------------------------------------
 
 Azure::Response<Azure::Storage::Blobs::Models::DownloadBlobResult>
 ContainerClientWrapper::downloadRange(
@@ -390,10 +388,15 @@ ContainerClientWrapper::downloadRange(
             try
             {
                 auto response = client.GetBlobClient(blob_prefix + blob_name).Download(options, azure_context);
+
+                if (!response.Value.BodyStream)
+                    throw Exception(ErrorCodes::RECEIVED_EMPTY_DATA,
+                        "Null body stream in Azure download response for {}", blob_prefix + blob_name);
+
                 logBlobStorageEventOnSuccess(
                     blob_log, BlobStorageLogElement::EventType::Read,
                     container_for_logging, blob_prefix + blob_name,
-                    /* data_size */ static_cast<size_t>(response.Value.BodyStream->Length()),
+                    static_cast<size_t>(response.Value.BodyStream->Length()),
                     watch.elapsedMicroseconds());
                 return response;
             }
@@ -557,14 +560,14 @@ void ContainerClientWrapper::commitBlockList(
                 logBlobStorageEventOnSuccess(
                     blob_log, BlobStorageLogElement::EventType::MultiPartUploadComplete,
                     container_for_logging, blob_prefix + blob_name,
-                    /* data_size */ 0, watch.elapsedMicroseconds());
+                    0, watch.elapsedMicroseconds());
             }
             catch (const Azure::Core::RequestFailedException & e)
             {
                 logBlobStorageEventOnFailure(
                     blob_log, BlobStorageLogElement::EventType::MultiPartUploadComplete,
                     container_for_logging, blob_prefix + blob_name,
-                    /* data_size */ 0, watch.elapsedMicroseconds(),
+                    0, watch.elapsedMicroseconds(),
                     static_cast<Int32>(e.StatusCode), e.Message);
                 throw;
             }
@@ -644,7 +647,7 @@ bool ContainerClientWrapper::UpdateBlobTag(
     const String & tag_value,
     LoggerPtr log) const
 {
-    return executeWithRetryRethrow(log, tag_key, 1, [&](size_t)
+    return executeWithRetryRethrow(log, blob_name, 1, [&](size_t)
     {
         auto tags = getBlobTagsForUpdate(blob_name);
         const auto tag_iter = tags.find(tag_key);
@@ -666,14 +669,7 @@ String ContainerClientWrapper::GetBlobUrl(const String & blob_name) const
     return client.GetBlockBlobClient(blob_prefix + blob_name).GetUrl();
 }
 
-/// The Azure SDK throws std::logic_error subtypes (std::invalid_argument from
-/// std::stoi for malformed ports, std::out_of_range for port overflow) when a
-/// connection string or blob URL has malformed components. These are user-input
-/// errors but must be translated to DB::Exception, otherwise they propagate to
-/// getCurrentExceptionMessageAndPattern, which catches std::logic_error and calls
-/// abortOnFailedAssertion in debug/sanitizer builds — turning a user typo into a
-/// "Logical error" abort.
-/// TODO: rename & simplify
+/// Azure SDK might throw errors on malformed URL/Blob strings - we will catch them in place, and will this helper to normalize the error
 [[noreturn]] static void translateAzureSdkParseError(const std::logic_error & e)
 {
     throw Exception(ErrorCodes::BAD_ARGUMENTS,

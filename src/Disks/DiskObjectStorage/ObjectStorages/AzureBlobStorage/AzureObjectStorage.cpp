@@ -166,35 +166,40 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
 {
     auto client_ptr = client.get();
 
-    Azure::Storage::Blobs::ListBlobsOptions options;
-    options.Prefix = path;
-    if (max_keys)
-        options.PageSizeHint = max_keys;
-    else
-        options.PageSizeHint = settings.get()->list_object_keys_size;
-
-    for (auto blob_list_response = client_ptr->ListBlobs(options); blob_list_response.HasPage(); blob_list_response.MoveToNextPage())
-    {
-        const auto & blobs_list = blob_list_response.Blobs;
-
-        for (const auto & blob : blobs_list)
+    AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow(
+        nullptr, path, 1,
+        [&](size_t)
         {
-            children.emplace_back(std::make_shared<RelativePathWithMetadata>(
-                blob.Name,
-                ObjectMetadata{
-                    .size_bytes = static_cast<uint64_t>(blob.BlobSize),
-                    .last_modified = Poco::Timestamp::fromEpochTime(
-                        std::chrono::duration_cast<std::chrono::seconds>(
-                            static_cast<std::chrono::system_clock::time_point>(blob.Details.LastModified).time_since_epoch()).count()),
-                    .etag = blob.Details.ETag.ToString(),
-                    .tags = {},
-                    .attributes = {},
-                }));
-        }
+            Azure::Storage::Blobs::ListBlobsOptions options;
+            options.Prefix = path;
+            if (max_keys)
+                options.PageSizeHint = max_keys;
+            else
+                options.PageSizeHint = settings.get()->list_object_keys_size;
 
-        if (max_keys && children.size() >= max_keys)
-            break;
-    }
+            for (auto blob_list_response = client_ptr->ListBlobs(options); blob_list_response.HasPage(); blob_list_response.MoveToNextPage())
+            {
+                const auto & blobs_list = blob_list_response.Blobs;
+
+                for (const auto & blob : blobs_list)
+                {
+                    children.emplace_back(std::make_shared<RelativePathWithMetadata>(
+                        blob.Name,
+                        ObjectMetadata{
+                            .size_bytes = static_cast<uint64_t>(blob.BlobSize),
+                            .last_modified = Poco::Timestamp::fromEpochTime(
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    static_cast<std::chrono::system_clock::time_point>(blob.Details.LastModified).time_since_epoch()).count()),
+                            .etag = blob.Details.ETag.ToString(),
+                            .tags = {},
+                            .attributes = {},
+                        }));
+                }
+
+                if (max_keys && children.size() >= max_keys)
+                    break;
+            }
+        });
 }
 
 std::unique_ptr<ReadBufferFromFileBase> AzureObjectStorage::readObject( /// NOLINT
@@ -343,6 +348,7 @@ void AzureObjectStorage::removeObjectsBatchIfExists(
 
         size_t avg_elapsed_us = watch.elapsedMicroseconds() / object_batch.size();
         std::exception_ptr throw_at_end;
+        String throw_at_end_path;
         for (const auto [object, deferred_response] : std::views::zip(object_batch, responses))
         {
             try
@@ -360,21 +366,30 @@ void AzureObjectStorage::removeObjectsBatchIfExists(
                 {
                     add_log_entry(object, avg_elapsed_us, static_cast<Int32>(e.StatusCode), e.Message);
 
-                    /// Fail fast on 403: the rest of the batch will hit the same 403.
-                    /// Deferred batch responses bypass the wrapper, so we translate here.
-                    if (isAzureForbiddenException(e))
-                        rethrowAzureException(e, object.remote_path);
-
                     if (!throw_at_end)
+                    {
                         throw_at_end = std::current_exception();
+                        /// we'll remember just one failed path from the batch, should be enough to investigate if needed
+                        throw_at_end_path = object.remote_path;
+                    }
 
                     continue;
                 }
             }
         }
 
+        /// This looks ugly, but it's needed to ensure we first iterate over all failed requests, and then we repeat try/catch/rethrow properly to translate errors correctly
         if (throw_at_end)
-            std::rethrow_exception(throw_at_end);
+        {
+            try
+            {
+                std::rethrow_exception(throw_at_end);
+            }
+            catch (const Azure::Core::RequestFailedException & e)
+            {
+                rethrowAzureException(e, throw_at_end_path);
+            }
+        }
     }
 }
 

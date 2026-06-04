@@ -16,6 +16,7 @@ namespace DB
 namespace FailPoints
 {
     extern const char thread_group_switcher_attach_failure[];
+    extern const char thread_group_link_thread_failure[];
 }
 
 /// Regression test for https://github.com/ClickHouse/clickhouse-core-incidents/issues/1682
@@ -95,6 +96,58 @@ TEST(ThreadGroupSwitcher, PartialAttachUndoneOnException)
         << "Second ThreadGroupSwitcher must attach successfully after the first one "
            "cleaned up its partial attachment; without the fix the stale group from the "
            "failed first attachment would block every subsequent task on this pool worker";
+}
+
+/// When linkThread() itself throws (e.g. bad_alloc from thread_ids.insert), active_thread_count
+/// was never incremented. The SCOPE_EXIT_SAFE rollback in attachToGroupImpl must NOT call
+/// unlinkThread() in that case, or it would corrupt the counter and hit the chassert.
+/// After the failure the thread must be clean and able to accept the next attachment.
+TEST(ThreadGroupSwitcher, LinkThreadFailureDoesNotCorruptCounter)
+{
+    auto context = getContext().context;
+
+    std::exception_ptr ex;
+    bool second_switcher_succeeded = false;
+
+    std::thread t([&]
+    {
+        try
+        {
+            ThreadStatus ts;
+
+            auto G1 = std::make_shared<ThreadGroup>(context, 0);
+            auto G2 = std::make_shared<ThreadGroup>(context, 0);
+
+            FailPointInjection::enableFailPoint(FailPoints::thread_group_link_thread_failure);
+
+            {
+                /// linkThread throws before active_thread_count is incremented.
+                /// The SCOPE_EXIT rollback must skip unlinkThread (linked=false).
+                /// ThreadStatus::thread_group is never set, so the thread is immediately clean.
+                ThreadGroupSwitcher switcher(G1, ThreadName::REMOTE_FS_READ_THREAD_POOL);
+            }
+
+            /// Thread is clean — second attachment must succeed.
+            {
+                ThreadGroupSwitcher switcher(G2, ThreadName::REMOTE_FS_READ_THREAD_POOL);
+                second_switcher_succeeded = (getCurrentThreadGroup() == G2);
+            }
+
+            ASSERT_EQ(getCurrentThreadGroup(), nullptr);
+        }
+        catch (...)
+        {
+            ex = std::current_exception();
+        }
+    });
+    t.join();
+
+    if (ex)
+        std::rethrow_exception(ex);
+
+    EXPECT_TRUE(second_switcher_succeeded)
+        << "linkThread failure must not corrupt active_thread_count and must leave the "
+           "thread clean for the next attachment";
 }
 
 } // namespace DB

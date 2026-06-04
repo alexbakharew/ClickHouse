@@ -44,6 +44,7 @@ namespace DB
 namespace FailPoints
 {
     extern const char thread_group_switcher_attach_failure[];
+    extern const char thread_group_link_thread_failure[];
 }
 
 namespace Setting
@@ -184,6 +185,10 @@ UInt64 ThreadGroup::getGroupElapsedMs() const
 void ThreadGroup::linkThread(UInt64 thread_id)
 {
     std::lock_guard lock(mutex);
+    fiu_do_on(FailPoints::thread_group_link_thread_failure,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure in ThreadGroup::linkThread");
+    });
     thread_ids.insert(thread_id);
 
     if (active_thread_count == 0)
@@ -358,30 +363,19 @@ void ThreadStatus::attachToGroupImpl(const ThreadGroupPtr & thread_group_)
 {
     thread_attach_time.setUp();
 
-    /// linkThread and thread_group assignment must be rolled back together on any
-    /// failure further down. The SCOPE_EXIT_SAFE fires when attachToGroupImpl throws
-    /// and undoes exactly what was done, leaving ThreadStatus in its original state.
-    /// SCOPE_EXIT_SAFE wraps the body in try/catch, so the rollback itself cannot
-    /// propagate and the calling ThreadGroupSwitcher (noexcept) is safe.
     thread_group_->linkThread(thread_id);
     thread_group = thread_group_;
     bool attach_succeeded = false;
+    /// Roll back the full attachment on any failure. detachFromGroup() undoes everything
+    /// attachToGroupImpl does (performance_counters/memory_tracker parents, query_context,
+    /// local_data, unlinkThread, etc.) and stays in sync automatically as the code evolves.
+    /// thread_group is assigned only after linkThread() succeeds, so if linkThread() threw,
+    /// thread_group is still null and detachFromGroup() returns immediately on its early check.
+    /// SCOPE_EXIT_SAFE wraps the body in try/catch so the rollback cannot propagate.
     SCOPE_EXIT_SAFE(
     {
         if (!attach_succeeded)
-        {
-            thread_group.reset();
-            thread_group_->unlinkThread();
-        }
-    });
-
-    /// Failpoint to simulate an exception thrown after thread_group is set but before
-    /// attachToGroupImpl returns — reproduces the exact failure path from
-    /// https://github.com/ClickHouse/clickhouse-core-incidents/issues/1682 where
-    /// TasksStatsCounters::reset() threw without a try/catch (26.4 regression).
-    fiu_do_on(FailPoints::thread_group_switcher_attach_failure,
-    {
-        throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure in attachToGroupImpl after thread_group set");
+            detachFromGroup();
     });
 
     performance_counters.setParent(&thread_group->performance_counters);
@@ -396,6 +390,19 @@ void ThreadStatus::attachToGroupImpl(const ThreadGroupPtr & thread_group_)
 
     applyGlobalSettings();
     applyQuerySettings();
+
+    /// Failpoint fires here: all context fields are already populated
+    /// (performance_counters/memory_tracker parents, query_context, local_data, …)
+    /// but initPerformanceCounters has not run yet. This mirrors the 26.4 incident
+    /// where TasksStatsCounters::reset() threw at exactly this point in the call
+    /// stack without a try/catch, leaving the thread attached to a stale group.
+    /// The rollback (detachFromGroup via SCOPE_EXIT_SAFE above) must reset all
+    /// those fields, not just thread_group + unlinkThread.
+    fiu_do_on(FailPoints::thread_group_switcher_attach_failure,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure in attachToGroupImpl after context fields set");
+    });
+
     initPerformanceCounters();
 
     if (thread_group->os_threads_nice_value != 0)

@@ -188,6 +188,7 @@ static struct InitFiu
     REGULAR(compact_part_writer_fail_in_add_streams) \
     REGULAR(transaction_force_unknown_state_after_commit) \
     ONCE(thread_group_switcher_attach_failure) \
+    ONCE(thread_group_link_thread_failure) \
     PAUSEABLE(transaction_after_commit_pause)
 
 namespace FailPoints

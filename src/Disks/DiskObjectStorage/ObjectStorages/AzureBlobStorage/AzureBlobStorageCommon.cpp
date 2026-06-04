@@ -175,52 +175,45 @@ BlockBlobClient ContainerClientWrapper::GetBlockBlobClient(const String & blob_n
     return client.GetBlockBlobClient(blob_prefix + blob_name);
 }
 
-/// TODO: to use or not to use executeWithRethrow for the methods below?
 BlobContainerPropertiesRespones ContainerClientWrapper::GetProperties() const
-try
 {
-    traceAzureGetProperties();
-    return client.GetProperties();
-}
-catch (const Azure::Storage::StorageException & e)
-{
-    rethrowAzureException(e, blob_prefix);
+    return executeWithRetryRethrow(nullptr, blob_prefix, 1, [&](size_t)
+    {
+        traceAzureGetProperties();
+        return client.GetProperties();
+    });
 }
 
 Azure::Response<Azure::Storage::Blobs::Models::BlobProperties> ContainerClientWrapper::GetBlobProperties(const String & blob_name) const
-try
 {
-    traceAzureGetProperties();
-    return client.GetBlobClient(blob_prefix + blob_name).GetProperties();
-}
-catch (const Azure::Storage::StorageException & e)
-{
-    rethrowAzureException(e, blob_prefix);
+    return executeWithRetryRethrow(nullptr, blob_prefix + blob_name, 1, [&](size_t)
+    {
+        traceAzureGetProperties();
+        return client.GetBlobClient(blob_prefix + blob_name).GetProperties();
+    });
 }
 
 ListBlobsPagedResponse ContainerClientWrapper::ListBlobs(const ListBlobsOptions & options) const
-try
 {
-    traceAzureListObjects();
-
-    auto new_options = options;
-    new_options.Prefix = blob_prefix + options.Prefix.ValueOr("");
-
-    auto response = client.ListBlobs(new_options);
-
-    for (auto & blob : response.Blobs)
+    return executeWithRetryRethrow(nullptr, blob_prefix, 1, [&](size_t)
     {
-        if (!blob.Name.starts_with(blob_prefix))
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected prefix '{}' in blob name '{}'", blob_prefix, blob.Name);
+        traceAzureListObjects();
 
-        blob.Name = blob.Name.substr(blob_prefix.size());
-    }
+        auto new_options = options;
+        new_options.Prefix = blob_prefix + options.Prefix.ValueOr("");
 
-    return response;
-}
-catch (const Azure::Storage::StorageException & e)
-{
-    rethrowAzureException(e, blob_prefix);
+        auto response = client.ListBlobs(new_options);
+
+        for (auto & blob : response.Blobs)
+        {
+            if (!blob.Name.starts_with(blob_prefix))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected prefix '{}' in blob name '{}'", blob_prefix, blob.Name);
+
+            blob.Name = blob.Name.substr(blob_prefix.size());
+        }
+
+        return response;
+    });
 }
 
 bool ContainerClientWrapper::IsClientForDisk() const
@@ -235,7 +228,10 @@ BlobContainerBatch ContainerClientWrapper::CreateBatch() const
 
 BlobBatchResultResponse ContainerClientWrapper::SubmitBatch(const BlobContainerBatch & batch) const
 {
-    return client.SubmitBatch(batch);
+    return executeWithRetryRethrow(nullptr, "batch_submit", 1, [&](size_t)
+    {
+        return client.SubmitBatch(batch);
+    });
 }
 
 String ContainerClientWrapper::GetBlobPath(const String & blob_name) const
@@ -588,40 +584,40 @@ void ContainerClientWrapper::deleteBlobSingleWithBlobStorageLog(
     const String full_path = blob_prefix + blob_name;
     Stopwatch watch;
 
-    try
+    executeWithRetryRethrow(nullptr, full_path, 1, [&](size_t)
     {
-        auto delete_info = client.GetBlobClient(full_path).Delete();
-        if (!if_exists && !delete_info.Value.Deleted)
-            throw Exception(
-                ErrorCodes::AZURE_BLOB_STORAGE_ERROR,
-                "Failed to delete file (path: {}) in AzureBlob Storage, reason: {}",
-                full_path,
-                delete_info.RawResponse ? delete_info.RawResponse->GetReasonPhrase() : "Unknown");
+        try
+        {
+            auto delete_info = client.GetBlobClient(full_path).Delete();
+            if (!if_exists && !delete_info.Value.Deleted)
+                throw Exception(
+                    ErrorCodes::AZURE_BLOB_STORAGE_ERROR,
+                    "Failed to delete file (path: {}) in AzureBlob Storage, reason: {}",
+                    full_path,
+                    delete_info.RawResponse ? delete_info.RawResponse->GetReasonPhrase() : "Unknown");
 
-        logBlobStorageEventOnSuccess(
-            blob_log, BlobStorageLogElement::EventType::Delete,
-            container_for_logging, full_path,
-            bytes_size_for_logging, watch.elapsedMicroseconds(),
-            local_path_for_logging);
-    }
-    catch (const Azure::Storage::StorageException & e)
-    {
-        logBlobStorageEventOnFailure(
-            blob_log, BlobStorageLogElement::EventType::Delete,
-            container_for_logging, full_path,
-            bytes_size_for_logging, watch.elapsedMicroseconds(),
-            static_cast<Int32>(e.StatusCode), e.Message,
-            local_path_for_logging);
+            logBlobStorageEventOnSuccess(
+                blob_log, BlobStorageLogElement::EventType::Delete,
+                container_for_logging, full_path,
+                bytes_size_for_logging, watch.elapsedMicroseconds(),
+                local_path_for_logging);
+        }
+        catch (const Azure::Core::RequestFailedException & e)
+        {
+            logBlobStorageEventOnFailure(
+                blob_log, BlobStorageLogElement::EventType::Delete,
+                container_for_logging, full_path,
+                bytes_size_for_logging, watch.elapsedMicroseconds(),
+                static_cast<Int32>(e.StatusCode), e.Message,
+                local_path_for_logging);
 
-        /// `if_exists=true` swallows a NotFound (object already gone is fine).
-        if (if_exists && e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
-            return;
-        if (!if_exists)
-            rethrowAzureException(e, full_path);
+            /// `if_exists=true` swallows a NotFound (object already gone is fine).
+            if (if_exists && e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
+                return;
 
-        tryLogCurrentException(__PRETTY_FUNCTION__);
-        rethrowAzureException(e, full_path);
-    }
+            throw;
+        }
+    });
 }
 
 DeleteBlobResultDeferredResponse ContainerClientWrapper::addDeleteBlobToBatch(
@@ -648,7 +644,7 @@ bool ContainerClientWrapper::UpdateBlobTag(
     const String & tag_value,
     LoggerPtr log) const
 {
-    return executeWithRethrow(tag_key, [&]
+    return executeWithRetryRethrow(log, tag_key, 1, [&](size_t)
     {
         auto tags = getBlobTagsForUpdate(blob_name);
         const auto tag_iter = tags.find(tag_key);
@@ -784,7 +780,7 @@ static bool containerExists(const ContainerClient & client)
         client.GetProperties();
         return true;
     }
-    catch (const Azure::Storage::StorageException & e)
+    catch (const Azure::Core::RequestFailedException & e)
     {
         if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
             return false;
@@ -801,7 +797,7 @@ static bool containerExists(const ContainerClient & client)
             return true;
         }
 
-        rethrowAzureException(e, "Azure container");
+        throw;
     }
 }
 
@@ -837,7 +833,7 @@ std::unique_ptr<ContainerClient> getContainerClient(const ConnectionParams & par
         auto raw_client = service_client->CreateBlobContainer(params.endpoint.container_name).Value;
         return std::make_unique<ContainerClient>(std::move(raw_client), params.endpoint.prefix);
     }
-    catch (const Azure::Storage::StorageException & e)
+    catch (const Azure::Core::RequestFailedException & e)
     {
         /// If container_already_exists is not set (in config), ignore already exists error. Conflict - The specified container already exists.
         /// To avoid race with creation of container, handle this error despite that we have already checked the existence of container.

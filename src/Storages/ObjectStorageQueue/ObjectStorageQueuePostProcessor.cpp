@@ -411,8 +411,7 @@ void ObjectStorageQueuePostProcessor::moveAzureBlobs(const StoredObjects & objec
                 try
                 {
                     doWithRetries([&]{
-                        Azure::Storage::Blobs::BlobClient blobClient = src_client->GetBlobClient(object_from.remote_path);
-                        auto properties = blobClient.GetProperties().Value;
+                        auto properties = src_client->GetBlobProperties(object_from.remote_path).Value;
                         auto blob_size = properties.BlobSize;
                         auto object_to = applyMovePrefixIfPresent(object_from, move_prefix, settings.after_processing_move_preserve_path);
                         auto request_settings = azure_storage->getSettings();

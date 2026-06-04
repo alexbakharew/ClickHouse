@@ -141,11 +141,11 @@ bool AzureObjectStorage::exists(const StoredObject & object) const
         client_ptr->GetBlobProperties(object.remote_path);
         return true;
     }
-    catch (const Azure::Storage::StorageException & e)
+    catch (const Azure::Core::RequestFailedException & e)
     {
         if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
             return false;
-        rethrowAzureException(e, object.remote_path);
+        throw;
     }
 }
 
@@ -350,7 +350,7 @@ void AzureObjectStorage::removeObjectsBatchIfExists(
                 deferred_response.GetResponse();
                 add_log_entry(object, avg_elapsed_us);
             }
-            catch (const Azure::Storage::StorageException & e)
+            catch (const Azure::Core::RequestFailedException & e)
             {
                 if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
                 {
@@ -361,11 +361,10 @@ void AzureObjectStorage::removeObjectsBatchIfExists(
                     add_log_entry(object, avg_elapsed_us, static_cast<Int32>(e.StatusCode), e.Message);
 
                     /// Fail fast on 403: the rest of the batch will hit the same 403.
-                    /// TODO: check logic here
+                    /// Deferred batch responses bypass the wrapper, so we translate here.
                     if (isAzureForbiddenException(e))
                         rethrowAzureException(e, object.remote_path);
 
-                    /// TODO: check logic here - trace thoroughly where it's thrown
                     if (!throw_at_end)
                         throw_at_end = std::current_exception();
 
@@ -430,7 +429,7 @@ try
 {
     return getObjectMetadata(path, with_tags);
 }
-catch (const Azure::Storage::StorageException & e)
+catch (const Azure::Core::RequestFailedException & e)
 {
     if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
         return {};

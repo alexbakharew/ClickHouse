@@ -138,47 +138,57 @@ struct UploadPartData
 };
 
 /// This wrapper is the single entry point to Azure SDK.
-/// .Callers should NOT acquire raw `BlobClient`/`BlockBlobClient` objects —
+/// Callers should NOT acquire raw `BlobClient`/`BlockBlobClient` objects —
 /// use the named data-plane methods below or add new ones.
+///
+/// Every public method that makes a network call is wrapped with
+/// `executeWithRetryRethrow` which translates HTTP 403 into
+/// `AZURE_ACCESS_DENIED` and optionally retries transient failures.
 class ContainerClientWrapper
 {
 public:
     ContainerClientWrapper(RawContainerClient client_, String blob_prefix_);
 
-    /// TODO: why naming is like that? Check and rename if possible
-
+    /// Check if client is configured for disk. Doesn't call remote Azure.
     bool IsClientForDisk() const;
-    BlobClient GetBlobClient(const String & blob_name) const;
-    BlockBlobClient GetBlockBlobClient(const String & blob_name) const;
-    BlobContainerPropertiesRespones GetProperties() const;
-    Azure::Response<Azure::Storage::Blobs::Models::BlobProperties> GetBlobProperties(const String & blob_name) const;
 
-    ListBlobsPagedResponse ListBlobs(const ListBlobsOptions & options) const;
-
+    /// Create an empty batch for delete operations. Doesn't call remote Azure.
     BlobContainerBatch CreateBatch() const;
-    BlobBatchResultResponse SubmitBatch(const BlobContainerBatch & batch) const;
+
+    /// Prepend blob prefix to blob name. Doesn't call remote Azure.
     String GetBlobPath(const String & blob_name) const;
 
+    /// Get full URL for a blob. Doesn't call remote Azure.
+    String GetBlobUrl(const String & blob_name) const;
+
+    /// Add a delete operation to a batch. Doesn't call remote Azure.
+    DeleteBlobResultDeferredResponse addDeleteBlobToBatch(
+        BlobContainerBatch & batch,
+        const String & blob_name) const;
+
+    /// Trace counter for batch delete operations. Doesn't call remote Azure.
+    void traceAzureDeleteObjects(size_t count = 1) const;
+
+    /// Fetch container-level properties. Calls remote Azure.
+    BlobContainerPropertiesRespones GetProperties() const;
+
+    /// Fetch properties for a single blob. Calls remote Azure.
+    Azure::Response<Azure::Storage::Blobs::Models::BlobProperties> GetBlobProperties(const String & blob_name) const;
+
+    /// List blobs matching a prefix. Calls remote Azure.
+    ListBlobsPagedResponse ListBlobs(const ListBlobsOptions & options) const;
+
+    /// Submit a batch of operations. Calls remote Azure.
+    BlobBatchResultResponse SubmitBatch(const BlobContainerBatch & batch) const;
+
+    /// Read-modify-write a single blob tag. Calls remote Azure.
     bool UpdateBlobTag(
         const String & blob_name,
         const String & tag_key,
         const String & tag_value,
         LoggerPtr log) const;
 
-    /// copyAzureBlobStorageFile native-copy path.
-    String GetBlobUrl(const String & blob_name) const;
-
-    /// Download a byte range from a blob.
-    ///   - range_length == 0 means "open-ended" (until end of blob); used by
-    ///     ReadBuffer::initialize when no read_until_position was set.
-    ///   - outer_attempt is propagated into the SDK retry context. Pass the
-    ///     caller's outer-retry-loop index (used by ReadBuffer::nextImpl) or
-    ///     leave the default 0 if the caller has no outer retry loop
-    ///     (used by ReadBuffer::readBigAt).
-    /// Retries internally up to num_tries on transient Azure failures, logs
-    /// each attempt to BlobStorageLog, increments
-    /// ReadBufferFromAzureRequestsErrors on failure, and translates Azure
-    /// exceptions on the final attempt.
+    /// Download a byte range from a blob. Calls remote Azure.
     Azure::Response<Azure::Storage::Blobs::Models::DownloadBlobResult>
         downloadRange(
             const String & blob_name,
@@ -190,15 +200,7 @@ public:
             const String & container_for_logging,
             size_t outer_attempt = 0) const;
 
-    /// Single-part block-blob upload.
-    ///   - write_settings != nullptr  ⇒ WriteBuffer path: AccessConditions
-    ///     (IfMatch/IfNoneMatch) honored, IO-write ResourceGuard acquired,
-    ///     and the per-attempt SDK retry-context key is set.
-    ///   - write_settings == nullptr  ⇒ copy path: plain upload, no options.
-    ///   - num_tries == 1 ⇒ no retry loop (used by copy path).
-    /// Logs every attempt to BlobStorageLog (success + failure); on the
-    /// final failed attempt translates Azure exceptions to ClickHouse
-    /// exceptions via executeWithRetryRethrow.
+    /// Upload blob content in a single request. Calls remote Azure.
     void uploadSinglePart(
         const String & blob_name,
         const uint8_t * data,
@@ -209,10 +211,7 @@ public:
         const BlobStorageLogWriterPtr & blob_log,
         const String & container_for_logging) const;
 
-    /// Stage one block of a multi-part upload.
-    /// Shape mirrors uploadSinglePart: pass write_settings != nullptr for the
-    /// WriteBuffer path (IO-write ResourceGuard + per-attempt SDK retry-ctx),
-    /// nullptr for the copy path. num_tries == 1 ⇒ no retry.
+    /// Stage a block for multipart upload. Calls remote Azure.
     void stageBlock(
         const String & blob_name,
         const String & block_id,
@@ -224,11 +223,7 @@ public:
         const BlobStorageLogWriterPtr & blob_log,
         const String & container_for_logging) const;
 
-    /// Commit a previously-staged block list.
-    /// write_settings != nullptr ⇒ WriteBuffer path: AccessConditions
-    /// (IfMatch/IfNoneMatch) honored + per-attempt SDK retry-ctx.
-    /// write_settings == nullptr ⇒ copy path: no options. num_tries == 1 ⇒
-    /// no retry. No body bytes, no ResourceGuard.
+    /// Commit staged blocks to finalize upload. Calls remote Azure.
     void commitBlockList(
         const String & blob_name,
         const std::vector<std::string> & block_ids,
@@ -238,10 +233,7 @@ public:
         const BlobStorageLogWriterPtr & blob_log,
         const String & container_for_logging) const;
 
-    /// AzureObjectStorage::removeObjectImpl single-blob delete with full
-    /// BlobStorageLog accounting (success, NotFound-with-if_exists, failure).
-    /// Returns true if the blob was actually deleted, false if it didn't
-    /// exist and `if_exists` was true.
+    /// Delete a single blob with logging. Calls remote Azure.
     void deleteBlobSingleWithBlobStorageLog(
         const String & blob_name,
         bool if_exists,
@@ -250,54 +242,28 @@ public:
         const String & local_path_for_logging,
         size_t bytes_size_for_logging) const;
 
-    /// AzureObjectStorage::removeObjectsBatchIfExists: enqueue a delete into
-    /// a batch built by `CreateBatch()`. Prepends the blob_prefix internally
-    /// so callers don't compute it.
-    DeleteBlobResultDeferredResponse addDeleteBlobToBatch(
-        BlobContainerBatch & batch,
-        const String & blob_name) const;
-
-    /// Server-side copy from a source URI. The Azure SDK exposes two distinct
-    /// entry points — `CopyFromUri` (synchronous) and `StartCopyFromUri`
-    /// (asynchronous) — which differ in the options struct used and the
-    /// return type. The compile-time dispatch keeps both call sites uniform.
-    ///   Options = CopyBlobFromUriOptions      → Azure::Response<CopyBlobFromUriResult>
-    ///   Options = StartBlobCopyFromUriOptions → StartBlobCopyOperation
+    /// Server-side copy from a source URI. Calls remote Azure.
     template <typename Options>
     auto copyBlobFromUri(
         const String & dest_blob_name,
         const String & source_uri,
         const Options & options) const
     {
-        /// TODO: please double check the fix of stat double increment (see AzureObjectStorage::copyObject and copyAzureBlobStorageFile
-        traceAzureCopyObject();
-        auto bbc = client.GetBlockBlobClient(blob_prefix + dest_blob_name);
-        if constexpr (std::is_same_v<Options, Azure::Storage::Blobs::CopyBlobFromUriOptions>)
-            return bbc.CopyFromUri(source_uri, options);
-        else
-            return bbc.StartCopyFromUri(source_uri, options);
+        return executeWithRetryRethrow(nullptr, dest_blob_name, 1, [&](size_t)
+        {
+            traceAzureCopyObject();
+            auto bbc = client.GetBlockBlobClient(blob_prefix + dest_blob_name);
+            if constexpr (std::is_same_v<Options, Azure::Storage::Blobs::CopyBlobFromUriOptions>)
+                return bbc.CopyFromUri(source_uri, options);
+            else
+                return bbc.StartCopyFromUri(source_uri, options);
+        });
     }
 
-    /// === Generic error/retry primitives (T1 + Option A) ===
-    ///
-    /// `executeWithRetryRethrow` is the single retry+rethrow primitive that
-    /// replaces today's three distinct retry-loop shapes (the deleted
-    /// `WriteBufferFromAzureBlobStorage::execWithRetry`, and the inline
-    /// for-loops in `ReadBufferFromAzureBlobStorage::nextImpl / initialize
-    /// / readBigAt`). The lambda receives the 0-based attempt number and
-    /// owns any ResourceGuard/throttler scoping it needs — keeping the
-    /// helper agnostic to IO-write vs IO-read scheduling.
-    ///
-    /// `executeWithRethrow` is the catch-only sibling: execute one Azure
-    /// SDK call and translate any `RequestFailedException` to a ClickHouse
-    /// exception via `rethrowAzureException`. No retry, no status-code
-    /// swallowing — sites that need to swallow specific codes (e.g.
-    /// NotFound → false in `exists`) keep their explicit inline if-check.
-    ///
-    /// Both are header-only templates because each call site instantiates
-    /// them with a unique lambda type; an explicit-instantiation cpp
-    /// approach is not practical.
-
+    /// Unified error-handling wrapper for all Azure SDK network calls.
+    /// Translates HTTP 403 → `AZURE_ACCESS_DENIED`. When `num_tries > 1`,
+    /// retries transient failures with exponential backoff.
+    /// Pass `num_tries = 1` for control-plane calls (no retry).
     template <typename F>
     static auto executeWithRetryRethrow(
         LoggerPtr log,
@@ -305,6 +271,9 @@ public:
         size_t num_tries,
         F && func) -> decltype(func(size_t{0}))
     {
+        if (!log)
+            log = default_log;
+
         size_t sleep_ms = 100;
         for (size_t i = 0; i < num_tries; ++i)
         {
@@ -323,7 +292,6 @@ public:
             }
             catch (...)
             {
-                /// It doesn't make sense to retry allocator errors
                 if (getCurrentExceptionCode() == ErrorCodes::CANNOT_ALLOCATE_MEMORY)
                     throw;
                 if (i + 1 >= num_tries)
@@ -338,18 +306,13 @@ public:
         UNREACHABLE();
     }
 
-    /// TODO: we still have several levels of catching/rethrowing errors (see WriteBufferFromAzureBlobStorage:168) - sort this out
-    /// only special case error should be caught without rethrowing
-
-    /// TODO: comment, explain why it's public (batch ops are controlled from outside)
-    void traceAzureDeleteObjects(size_t count = 1) const;
-
 private:
-    /// === Universal tracing helpers (ProfileEvents pairs) ===
-    ///
-    /// Each `traceAzure<Op>` increments the generic `Azure<Op>` event, and
-    /// additionally the `DiskAzure<Op>` counterpart when `IsClientForDisk()`
-    /// returns true. Replaces the copy-pasted pair at every call site.
+
+    /// Get a raw BlobClient handle. Doesn't call remote Azure.
+    BlobClient GetBlobClient(const String & blob_name) const;
+
+    /// Get a raw BlockBlobClient handle. Doesn't call remote Azure.
+    BlockBlobClient GetBlockBlobClient(const String & blob_name) const;
 
     void traceAzureListObjects(size_t count = 1) const;
     void traceAzureCopyObject() const;
@@ -358,12 +321,6 @@ private:
     void traceAzureStageBlock() const;
     void traceAzureCommitBlockList() const;
     void traceAzureGetObject() const;
-
-    /// === Universal BlobStorageLog helpers ===
-    ///
-    /// These replace the `Stopwatch + error_code + error_message +
-    /// blob_log->addEvent(...)` triplet that was hand-rolled at every SDK
-    /// call site. They are no-ops if `blob_log` is nullptr.
 
     static void logBlobStorageEventOnSuccess(
         const BlobStorageLogWriterPtr & blob_log,
@@ -385,37 +342,17 @@ private:
         const String & error_message,
         const String & local_path_for_logging = {});
 
-    /// Apply WriteSettings's object_storage_write_if_match / if_none_match to an
-    /// Azure SDK BlobAccessConditions. No-op for empty ETag strings. Used by
-    /// uploadSinglePart and commitBlockList on the WriteBuffer path.
     static void applyAccessConditions(
         Azure::Storage::Blobs::BlobAccessConditions & access_conditions,
         const WriteSettings & write_settings);
 
-    /// === Tier-2 catch-and-translate primitive (private) ===
-    ///
-    /// Now used only inside the wrapper's own `…WithRethrow` methods.
-    /// Site 5 (`ReadBuffer::nextImpl`) is the only external caller of
-    /// `executeWithRetryRethrow` and lives outside this class — that one
-    /// stays public above.
-    template <typename F>
-    static auto executeWithRethrow(std::string_view resource_for_logging, F && func)
-        -> decltype(func())
-    {
-        try
-        {
-            return func();
-        }
-        catch (const Azure::Core::RequestFailedException & e)
-        {
-            rethrowAzureException(e, std::string{resource_for_logging});
-        }
-    }
-
-    /// AzureObjectStorage::tagObjects building blocks (private; the only
-    /// external caller goes through `updateSingleBlobTagIfDifferentWithRethrow`).
+    /// Fetch blob tags for update. Calls remote Azure.
     std::map<std::string, std::string> getBlobTagsForUpdate(const String & blob_name) const;
+
+    /// Set blob tags. Calls remote Azure.
     void setBlobTags(const String & blob_name, const std::map<std::string, std::string> & tags) const;
+
+    static inline const LoggerPtr default_log = getLogger("ContainerClientWrapper");
 
     RawContainerClient client;
     String blob_prefix;

@@ -5,7 +5,6 @@
 #include <Disks/IO/ReadBufferFromAzureBlobStorage.h>
 #include <Common/BlobStorageLogWriter.h>
 #include <Common/ElapsedTimeProfileEventIncrement.h>
-#include <IO/AzureBlobStorage/isRetryableAzureException.h>
 #include <IO/ReadBufferFromString.h>
 #include <Common/logger_useful.h>
 #include <Common/Stopwatch.h>
@@ -260,33 +259,45 @@ size_t ReadBufferFromAzureBlobStorage::readBigAt(char * to, size_t n, size_t ran
 
     ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::ReadBufferFromAzureMicroseconds);
 
-    while (n > 0)
-    {
-        size_t bytes_copied = 0;
+    AzureBlobStorage::ContainerClientWrapper::executeWithRetryRethrow(
+        log, path, max_single_download_retries,
+        [&](size_t attempt)
+        {
+            while (n > 0)
+            {
+                auto download_response = blob_container_client->downloadRange(
+                    path,
+                    /* range_offset */ range_begin,
+                    /* range_length */ n,
+                    attempt > 0 ? 1 : max_single_download_retries, log,
+                    blob_storage_log, container_for_logging);
 
-        auto download_response = blob_container_client->downloadRange(
-            path,
-            /* range_offset */ range_begin,
-            /* range_length */ n,
-            max_single_download_retries, log,
-            blob_storage_log, container_for_logging);
+                setMetadataFromResponse(download_response.Value.Details, download_response.Value.BlobSize);
 
-        setMetadataFromResponse(download_response.Value.Details, download_response.Value.BlobSize);
+                std::unique_ptr<Azure::Core::IO::BodyStream> body_stream = std::move(download_response.Value.BodyStream);
+                size_t bytes_copied = 0;
+                try
+                {
+                    bytes_copied = body_stream->ReadToCount(reinterpret_cast<uint8_t *>(to), body_stream->Length());
+                }
+                catch (...)
+                {
+                    ProfileEvents::increment(ProfileEvents::ReadBufferFromAzureRequestsErrors);
+                    throw;
+                }
 
-        std::unique_ptr<Azure::Core::IO::BodyStream> body_stream = std::move(download_response.Value.BodyStream);
-        bytes_copied = body_stream->ReadToCount(reinterpret_cast<uint8_t *>(to), body_stream->Length());
+                LOG_TEST(log, "AzureBlobStorage readBigAt read bytes {}", bytes_copied);
 
-        LOG_TEST(log, "AzureBlobStorage readBigAt read bytes {}", bytes_copied);
+                if (read_settings.remote_throttler)
+                    read_settings.remote_throttler->throttle(bytes_copied);
 
-        if (read_settings.remote_throttler)
-            read_settings.remote_throttler->throttle(bytes_copied);
+                ProfileEvents::increment(ProfileEvents::ReadBufferFromAzureBytes, bytes_copied);
 
-        ProfileEvents::increment(ProfileEvents::ReadBufferFromAzureBytes, bytes_copied);
-
-        range_begin += bytes_copied;
-        to += bytes_copied;
-        n -= bytes_copied;
-    }
+                range_begin += bytes_copied;
+                to += bytes_copied;
+                n -= bytes_copied;
+            }
+        });
 
     return initial_n;
 }

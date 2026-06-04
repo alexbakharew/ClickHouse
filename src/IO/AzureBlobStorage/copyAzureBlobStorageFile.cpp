@@ -12,7 +12,6 @@
 #include <IO/WriteBufferFromVector.h>
 #include <Disks/IO/ReadBufferFromAzureBlobStorage.h>
 #include <Disks/IO/WriteBufferFromAzureBlobStorage.h>
-#include <IO/AzureBlobStorage/isRetryableAzureException.h>
 #include <Common/getRandomASCIIString.h>
 
 
@@ -444,7 +443,7 @@ void copyAzureBlobStorageFile(
             }
             is_native_copy_done = true;
         }
-        catch (const Azure::Storage::StorageException & e)
+        catch (const Azure::Core::RequestFailedException & e)
         {
             if (e.StatusCode == Azure::Core::Http::HttpStatusCode::Unauthorized)
             {
@@ -459,7 +458,7 @@ void copyAzureBlobStorageFile(
                           e.what(), src_container_for_logging, src_blob, dest_container_for_logging, dest_blob);
             }
             else
-                rethrowAzureException(e, dest_blob);
+                throw;
         }
     }
     if (!is_native_copy_done)

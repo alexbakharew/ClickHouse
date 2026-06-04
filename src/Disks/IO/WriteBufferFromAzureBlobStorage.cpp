@@ -3,7 +3,6 @@
 #if USE_AZURE_BLOB_STORAGE
 
 #include <Disks/IO/WriteBufferFromAzureBlobStorage.h>
-#include <IO/AzureBlobStorage/isRetryableAzureException.h>
 #include <Common/getRandomASCIIString.h>
 #include <Common/logger_useful.h>
 #include <Common/Throttler.h>
@@ -171,15 +170,14 @@ void WriteBufferFromAzureBlobStorage::finalizeImpl()
         {
             blob_container_client->GetBlobProperties(blob_path);
         }
-        catch (const Azure::Storage::StorageException & e)
+        catch (const Azure::Core::RequestFailedException & e)
         {
             if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
                 throw Exception(
                         ErrorCodes::AZURE_BLOB_STORAGE_ERROR,
                         "Object {} not uploaded to azure blob storage, it's a bug in Azure Blob Storage or its API.",
                         blob_path);
-            /// TODO: is this one needed? is rethrowAzureException actually needed?
-            rethrowAzureException(e, blob_path);
+            throw;
         }
     }
 }

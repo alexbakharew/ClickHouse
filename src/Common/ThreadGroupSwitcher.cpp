@@ -55,21 +55,6 @@ ThreadGroupSwitcher::ThreadGroupSwitcher(ThreadGroupPtr thread_group_, ThreadNam
     {
         /// Unexpected. For caller's convenience avoid throwing exceptions.
         DB::tryLogCurrentException(__PRETTY_FUNCTION__);
-        /// If CurrentThread::attachToGroup() partially succeeded — it set
-        /// ThreadStatus::thread_group before throwing (e.g. initPerformanceCounters()
-        /// threw inside attachToGroupImpl()) — we must undo the attachment.  Without
-        /// this, the thread stays permanently attached to the stale group and every
-        /// subsequent ThreadGroupSwitcher on the same pool worker throws
-        /// "Thread is already attached to a group" (incident #1682).
-        if (thread_group && CurrentThread::getGroup() == thread_group)
-        {
-            CurrentThread::detachFromGroupIfNotDetached();
-            if (prev_thread_group)
-            {
-                LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
-                CurrentThread::attachToGroup(prev_thread_group);
-            }
-        }
         thread_group = nullptr;
         prev_thread_group = nullptr;
     }

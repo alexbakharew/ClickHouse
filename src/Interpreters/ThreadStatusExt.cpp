@@ -17,6 +17,7 @@
 #include <Common/CurrentThread.h>
 #include <Common/DateLUT.h>
 #include <Common/Exception.h>
+#include <Common/scope_guard_safe.h>
 #include <Common/FailPoint.h>
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
@@ -357,14 +358,27 @@ void ThreadStatus::attachToGroupImpl(const ThreadGroupPtr & thread_group_)
 {
     thread_attach_time.setUp();
 
-    /// Attach or init current thread to thread group and copy useful information from it
+    /// linkThread and thread_group assignment must be rolled back together on any
+    /// failure further down. The SCOPE_EXIT_SAFE fires when attachToGroupImpl throws
+    /// and undoes exactly what was done, leaving ThreadStatus in its original state.
+    /// SCOPE_EXIT_SAFE wraps the body in try/catch, so the rollback itself cannot
+    /// propagate and the calling ThreadGroupSwitcher (noexcept) is safe.
+    thread_group_->linkThread(thread_id);
     thread_group = thread_group_;
-    thread_group->linkThread(thread_id);
+    bool attach_succeeded = false;
+    SCOPE_EXIT_SAFE(
+    {
+        if (!attach_succeeded)
+        {
+            thread_group.reset();
+            thread_group_->unlinkThread();
+        }
+    });
 
     /// Failpoint to simulate an exception thrown after thread_group is set but before
     /// attachToGroupImpl returns — reproduces the exact failure path from
     /// https://github.com/ClickHouse/clickhouse-core-incidents/issues/1682 where
-    /// TasksStatsCounters::reset() threw without a try/catch.
+    /// TasksStatsCounters::reset() threw without a try/catch (26.4 regression).
     fiu_do_on(FailPoints::thread_group_switcher_attach_failure,
     {
         throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure in attachToGroupImpl after thread_group set");
@@ -388,6 +402,8 @@ void ThreadStatus::attachToGroupImpl(const ThreadGroupPtr & thread_group_)
     {
         OSThreadNiceValue::set(thread_group->os_threads_nice_value);
     }
+
+    attach_succeeded = true;
 }
 
 void ThreadStatus::detachFromGroup()

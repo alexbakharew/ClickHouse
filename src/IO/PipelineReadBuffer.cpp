@@ -1,6 +1,7 @@
 #include <IO/PipelineReadBuffer.h>
 #include <IO/ReaderExecutor.h>
 #include <Common/Exception.h>
+#include <Common/Stopwatch.h>
 #include <Common/logger_useful.h>
 
 namespace DB
@@ -23,11 +24,22 @@ PipelineReadBuffer::~PipelineReadBuffer() = default;
 
 bool PipelineReadBuffer::nextImpl()
 {
+    Stopwatch watch(profile_callback ? clock_type : CLOCK_MONOTONIC);
     auto chunk = executor->readNextChunk();
     if (chunk.size == 0)
     {
         LOG_TRACE(log, "nextImpl: EOF at {}", read_position);
         return false;
+    }
+
+    /// Report the read so `MergeTreeReadPool`'s slow-read backoff still sees it.
+    if (profile_callback)
+    {
+        ProfileInfo info{};
+        info.bytes_requested = chunk.size;
+        info.bytes_read = chunk.size;
+        info.nanoseconds = watch.elapsed();
+        profile_callback(info);
     }
 
     /// `chunk.data` is read-only and owned by the executor; we only expose it,

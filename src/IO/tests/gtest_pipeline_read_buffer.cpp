@@ -126,4 +126,25 @@ TEST_F(PipelineReadBufferTest, SeekCurRelative)
     EXPECT_EQ(static_cast<unsigned char>(c), patternByte(150));
 }
 
+TEST_F(PipelineReadBufferTest, InvokesProfileCallback)
+{
+    /// MergeTreeReadPool's slow-read backoff relies on the profile callback being
+    /// invoked for each read; the executor path must keep feeding it.
+    auto buf = makeBuffer({makeFile("a.bin", 1024)}, /*block_size=*/256);
+
+    size_t calls = 0;
+    size_t reported = 0;
+    buf->setProfileCallback([&](ReadBufferFromFileBase::ProfileInfo info)
+    {
+        ++calls;
+        reported += info.bytes_read;
+    }, CLOCK_MONOTONIC);
+
+    std::vector<char> data(1024);
+    buf->readStrict(data.data(), data.size());
+
+    EXPECT_GT(calls, 0u);
+    EXPECT_EQ(reported, 1024u);
+}
+
 }

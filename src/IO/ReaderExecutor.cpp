@@ -56,6 +56,11 @@ ReaderExecutor::Chunk ReaderExecutor::readNextChunk()
     if (object_offset > 0)
         buffer->seek(static_cast<off_t>(object_offset), SEEK_SET);
 
+    /// Bound the request to the chunk so a remote source fetches exactly `want`
+    /// bytes rather than an open-ended tail that is then cancelled.
+    if (buffer->supportsRightBoundedReads())
+        buffer->setReadUntilPosition(object_offset + want);
+
     block.resize(want);
     const size_t got = buffer->read(block.data(), want);
 

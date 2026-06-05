@@ -166,4 +166,28 @@ TEST_F(PipelineReadBufferTest, SetReadUntilPositionBoundsRead)
     EXPECT_EQ(total, 500u);
 }
 
+TEST_F(PipelineReadBufferTest, NarrowingReadUntilAfterBufferingTrims)
+{
+    /// Fill a block, consume part of it, then narrow the bound into the buffered
+    /// region: the already-buffered bytes past the bound must not be returned.
+    auto buf = makeBuffer({makeFile("a.bin", 1024)}, /*block_size=*/256);
+
+    char head[128];
+    buf->readStrict(head, sizeof(head));
+    EXPECT_EQ(buf->getPosition(), 128);
+
+    buf->setReadUntilPosition(200);
+
+    size_t total = 128;
+    while (true)
+    {
+        char tmp[64];
+        size_t got = buf->read(tmp, sizeof(tmp));
+        if (got == 0)
+            break;
+        total += got;
+    }
+    EXPECT_EQ(total, 200u);
+}
+
 }

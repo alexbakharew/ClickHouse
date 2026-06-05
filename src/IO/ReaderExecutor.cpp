@@ -52,6 +52,10 @@ ReaderExecutor::Chunk ReaderExecutor::readNextChunk()
         }
     }
 
+    /// `atEnd` already returns at the bound, so here `position < *read_until`.
+    if (read_until && *read_until - position < want)
+        want = *read_until - position;
+
     auto buffer = source->open(*object);
     if (object_offset > 0)
         buffer->seek(static_cast<off_t>(object_offset), SEEK_SET);

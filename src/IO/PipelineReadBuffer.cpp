@@ -89,6 +89,16 @@ off_t PipelineReadBuffer::getPosition()
     return read_position - available();
 }
 
+void PipelineReadBuffer::setReadUntilPosition(size_t position)
+{
+    executor->setReadUntil(position);
+}
+
+void PipelineReadBuffer::setReadUntilEnd()
+{
+    executor->setReadUntil(std::nullopt);
+}
+
 std::optional<size_t> PipelineReadBuffer::tryGetFileSize()
 {
     /// Unknown-size sources (S3 HEAD without Content-Length) must surface as

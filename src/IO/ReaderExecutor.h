@@ -8,6 +8,7 @@
 #include <base/types.h>
 
 #include <memory>
+#include <optional>
 
 namespace DB
 {
@@ -46,6 +47,10 @@ public:
 
     void seek(size_t new_position);
 
+    /// Bound reads to logical offsets below `position`; `nullopt` reads to the
+    /// file end. Used by callers (e.g. `StorageLog`) that need a hard read bound.
+    void setReadUntil(std::optional<size_t> bound) { read_until = bound; }
+
     size_t getPosition() const { return position; }
 
     size_t totalSize() const { return offset_map.totalSize(); }
@@ -57,10 +62,13 @@ public:
 
 private:
     /// At known size, EOF is `position >= totalSize`. At unknown size, a short
-    /// source read latches `reached_eof`; a backward `seek` clears it.
+    /// source read latches `reached_eof`; a backward `seek` clears it. A
+    /// `read_until` bound caps EOF earlier.
     bool atEnd() const
     {
-        return reached_eof || (!offset_map.hasUnknownSize() && position >= totalSize());
+        if (reached_eof || (read_until && position >= *read_until))
+            return true;
+        return !offset_map.hasUnknownSize() && position >= totalSize();
     }
 
     std::shared_ptr<ISourceReader> source;
@@ -69,6 +77,8 @@ private:
     size_t block_size;
     size_t position = 0;
     bool reached_eof = false;
+    /// Hard upper bound on the logical read position; `nullopt` = read to end.
+    std::optional<size_t> read_until;
 
     /// Backs the bytes returned by the latest `readNextChunk`.
     Memory<> block;

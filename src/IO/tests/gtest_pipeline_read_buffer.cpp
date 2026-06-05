@@ -147,4 +147,23 @@ TEST_F(PipelineReadBufferTest, InvokesProfileCallback)
     EXPECT_EQ(reported, 1024u);
 }
 
+TEST_F(PipelineReadBufferTest, SetReadUntilPositionBoundsRead)
+{
+    /// A hard bound (as StorageLog sets under the read lock) must stop the read
+    /// at the bound even though the file is larger.
+    auto buf = makeBuffer({makeFile("a.bin", 1024)}, /*block_size=*/256);
+    buf->setReadUntilPosition(500);
+
+    size_t total = 0;
+    while (true)
+    {
+        char tmp[128];
+        size_t got = buf->read(tmp, sizeof(tmp));
+        if (got == 0)
+            break;
+        total += got;
+    }
+    EXPECT_EQ(total, 500u);
+}
+
 }

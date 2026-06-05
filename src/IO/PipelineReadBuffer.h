@@ -26,6 +26,11 @@ public:
     off_t getPosition() override;
     std::optional<size_t> tryGetFileSize() override;
 
+    /// A hard read bound (e.g. `StorageLog`/`StorageStripeLog` cap reads to the
+    /// size snapshotted under the read lock so concurrent appends aren't read).
+    void setReadUntilPosition(size_t position) override;
+    void setReadUntilEnd() override;
+
     /// Random-read / size probes must be denied for unknown-size sources: a
     /// `true` answer leads formats (Parquet/ORC/Arrow) to call
     /// `getFileSizeFromReadBuffer`, which throws `UNKNOWN_FILE_SIZE`. Such

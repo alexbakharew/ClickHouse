@@ -223,8 +223,8 @@ def test_redis_storage_type_key_constraints(started_cluster):
     redis_client = redis.Redis(
         host="localhost", port=started_cluster.redis_port, password="clickhouse", db=DB_INDEX
     )
-    redis_client.set("k1", "v1")
     redis_client.flushdb()
+    redis_client.set("k1", "v1")
 
     node.query("DROP DICTIONARY IF EXISTS test_redis_simple_single")
     node.query(

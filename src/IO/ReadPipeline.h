@@ -228,6 +228,14 @@ private:
     std::optional<AsyncPrefetchStage> async_prefetch;
     VectorWithMemoryTracking<DecryptionStage> decryption_stages;
 
+    /// Experimental `ReaderExecutor` path (gated by `use_reader_executor`).
+    /// Returns nullptr when the setting is off, the source variant is not yet
+    /// supported, or any stage the minimal executor can't handle (caches,
+    /// decryption, distributed cache) is configured — so the caller falls back
+    /// to the legacy matryoshka pipeline. When it returns a buffer, `build` must
+    /// NOT apply the `wrap*` stages.
+    std::unique_ptr<ReadBufferFromFileBase> tryBuildReaderExecutor() const;
+
     /// build() helpers: one per logical stage group.
     /// Each helper reads private state and returns the (partial) impl buffer.
     /// `query_id` is captured once on the calling thread before any stage runs.

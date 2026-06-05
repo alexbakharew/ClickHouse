@@ -1,0 +1,46 @@
+#pragma once
+
+#include <IO/ReadBufferFromFileBase.h>
+#include <Common/Logger.h>
+
+#include <memory>
+#include <optional>
+
+namespace DB
+{
+
+class ReaderExecutor;
+
+/// Thin `ReadBufferFromFileBase` over a `ReaderExecutor` (experimental
+/// `use_reader_executor` path). `nextImpl` points `working_buffer` at the
+/// executor's current block; `seek` delegates to the executor. Legacy callers
+/// see a normal seekable file buffer.
+class PipelineReadBuffer : public ReadBufferFromFileBase
+{
+public:
+    explicit PipelineReadBuffer(std::unique_ptr<ReaderExecutor> executor);
+    ~PipelineReadBuffer() override;
+
+    String getFileName() const override;
+    off_t seek(off_t off, int whence) override;
+    off_t getPosition() override;
+    std::optional<size_t> tryGetFileSize() override;
+
+    /// Random-read / size probes must be denied for unknown-size sources: a
+    /// `true` answer leads formats (Parquet/ORC/Arrow) to call
+    /// `getFileSizeFromReadBuffer`, which throws `UNKNOWN_FILE_SIZE`. Such
+    /// sources are read by streaming through `nextImpl` instead.
+    bool checkIfActuallySeekable() override;
+
+private:
+    bool nextImpl() override;
+
+    std::unique_ptr<ReaderExecutor> executor;
+    /// Logical offset just past the last byte exposed via `working_buffer`.
+    /// `getPosition()` subtracts `available()` to get the caller's current read
+    /// position.
+    size_t read_position = 0;
+    LoggerPtr log = getLogger("PipelineReadBuffer");
+};
+
+}

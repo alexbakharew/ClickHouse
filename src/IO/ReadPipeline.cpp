@@ -12,6 +12,10 @@
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/ReadBufferFromFileDecorator.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/ReaderExecutor.h>
+#include <IO/PipelineReadBuffer.h>
+#include <IO/LocalSourceReader.h>
+#include <IO/ObjectStorageSourceReader.h>
 #include <IO/FileEncryptionCommon.h>
 #include <Interpreters/FileCache/FileCache.h>
 #include <Interpreters/FileCache/FileCacheKey.h>
@@ -166,6 +170,14 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::build() const
     /// query context). Subsequent cached-buffer creations happen lazily inside
     /// gather/impl creators that may run on threadpool workers without query
     /// context, so calling `CurrentThread::getQueryId()` there would return "".
+    /// Experimental `ReaderExecutor` path. When it returns a buffer it owns the
+    /// whole read (it must bypass the `wrap*` stages below — those wrap the
+    /// legacy matryoshka). Returns nullptr (fall back to the legacy path) when the
+    /// setting is off or the configuration is one the minimal executor can't
+    /// handle yet.
+    if (auto pipeline_buf = tryBuildReaderExecutor())
+        return pipeline_buf;
+
     const std::string query_id(CurrentThread::getQueryId());
 
     auto impl = gather
@@ -177,6 +189,55 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::build() const
     impl = wrapDecryption(std::move(impl));    // Stage 6 (encryption)
 
     return impl;
+}
+
+std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::tryBuildReaderExecutor() const
+{
+    const auto & settings = source->read_settings;
+    if (!settings.use_reader_executor)
+        return nullptr;
+
+    /// The minimal executor handles neither caches, decryption, nor the
+    /// distributed cache yet. Fall back to the legacy path (never silently skip
+    /// a configured stage) when any of them is requested.
+    if (distributed_cache || memory_cache || !filesystem_caches.empty() || !decryption_stages.empty())
+    {
+        LOG_DEBUG(getLogger("ReadPipeline"),
+            "use_reader_executor: falling back to the legacy read path "
+            "(caches/decryption not yet supported by the executor)");
+        return nullptr;
+    }
+
+    /// Only local files and object storage are wired into the executor so far.
+    /// The executor reads in blocks of the source's existing read-buffer size —
+    /// no dedicated executor block-size setting.
+    std::shared_ptr<ISourceReader> source_reader;
+    size_t block_size = 0;
+    if (const auto * local_src = std::get_if<LocalFileSource>(&source->source))
+    {
+        LOG_DEBUG(getLogger("ReadPipeline"), "build: using ReaderExecutor for local file, {} objects, path={}",
+            source->objects.size(), local_src->path);
+        source_reader = std::make_shared<LocalSourceReader>(settings);
+        block_size = settings.local_fs_settings.buffer_size;
+    }
+    else if (const auto * obj_src = std::get_if<ObjectStorageSource>(&source->source))
+    {
+        LOG_DEBUG(getLogger("ReadPipeline"), "build: using ReaderExecutor for object storage, {} objects, gather={}",
+            source->objects.size(), gather);
+        source_reader = std::make_shared<ObjectStorageSourceReader>(obj_src->storage, settings);
+        block_size = settings.remote_fs_settings.buffer_size;
+    }
+
+    if (!source_reader)
+    {
+        LOG_DEBUG(getLogger("ReadPipeline"),
+            "use_reader_executor: falling back to the legacy read path (source kind not supported by the executor)");
+        return nullptr;
+    }
+
+    auto executor = std::make_unique<ReaderExecutor>(source_reader, source->objects, block_size);
+
+    return std::make_unique<PipelineReadBuffer>(std::move(executor));
 }
 
 std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::buildGatherStage(const std::string & query_id) const

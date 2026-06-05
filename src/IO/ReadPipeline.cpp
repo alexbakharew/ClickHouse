@@ -193,9 +193,10 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::tryBuildReaderExecutor() c
     if (!settings.use_reader_executor)
         return nullptr;
 
-    /// The executor does not implement caches, decryption, or the distributed
-    /// cache, so fall back rather than silently drop a configured stage.
-    if (distributed_cache || memory_cache || !filesystem_caches.empty() || !decryption_stages.empty())
+    /// The executor does not implement caches, decryption, async prefetch, or the
+    /// distributed cache, so fall back rather than silently drop a configured stage.
+    if (distributed_cache || memory_cache || !filesystem_caches.empty()
+        || !decryption_stages.empty() || async_prefetch)
     {
         LOG_DEBUG(getLogger("ReadPipeline"),
             "use_reader_executor: falling back to the legacy read path "
@@ -215,6 +216,20 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::tryBuildReaderExecutor() c
     }
     else if (const auto * obj_src = std::get_if<ObjectStorageSource>(&source->source))
     {
+        /// An object of unknown size (HEAD without Content-Length) arrives with
+        /// `bytes_size` 0 — indistinguishable from a genuinely empty object — and
+        /// the executor cannot stream to EOF yet, so fall back rather than read it
+        /// as empty.
+        for (const auto & object : source->objects)
+        {
+            if (object.bytes_size == 0 || object.bytes_size == StoredObject::UnknownSize)
+            {
+                LOG_DEBUG(getLogger("ReadPipeline"),
+                    "use_reader_executor: falling back to the legacy read path (object size unknown)");
+                return nullptr;
+            }
+        }
+
         LOG_DEBUG(getLogger("ReadPipeline"), "build: using ReaderExecutor for object storage, {} objects, gather={}",
             source->objects.size(), gather);
         source_reader = std::make_shared<ObjectStorageSourceReader>(obj_src->storage, settings);

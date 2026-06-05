@@ -164,4 +164,17 @@ TEST_F(ReaderExecutorTest, EmptyFileIsImmediateEOF)
     EXPECT_EQ(chunk.size, 0u);
 }
 
+TEST_F(ReaderExecutorTest, MissingFileWithUnknownSizeThrows)
+{
+    /// `DiskLocal::prepareRead` marks an unstatable file `UnknownSize`; the
+    /// executor must then open it and surface the real error (e.g. file does not
+    /// exist) instead of treating it as an empty read.
+    StoredObject missing;
+    missing.remote_path = (tmp_dir / "does_not_exist.bin").string();
+    missing.bytes_size = StoredObject::UnknownSize;
+    ReaderExecutor ex(std::make_shared<LocalSourceReader>(), {missing}, /*block_size=*/256);
+
+    EXPECT_ANY_THROW(ex.readNextChunk());
+}
+
 }

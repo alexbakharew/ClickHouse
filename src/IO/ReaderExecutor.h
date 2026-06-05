@@ -14,14 +14,10 @@ namespace DB
 
 class ReadBufferFromFileBase;
 
-/// Minimal pipeline read executor — the first, deliberately dumb step of the
-/// `ReaderExecutor` (experimental, gated by `use_reader_executor`). It maps a
-/// logical read position to a `StoredObject` (via `OffsetMap`) and serves bytes
-/// straight from an `ISourceReader`, one block at a time, into an owned buffer.
-///
-/// No caches, no `Rope`, no prefetch, no live-connection pooling, no memory
-/// pressure adaptation, no decryption, no stats — those arrive in later steps.
-/// One instance per column-stream; not thread-safe.
+/// Maps a logical read position to a `StoredObject` (via `OffsetMap`) and serves
+/// bytes from an `ISourceReader`, one block at a time, into an owned buffer.
+/// Drives the experimental `use_reader_executor` read path. One instance per
+/// column-stream; not thread-safe.
 class ReaderExecutor
 {
 public:
@@ -32,13 +28,11 @@ public:
         const StoredObjects & objects,
         size_t block_size = DEFAULT_BLOCK_SIZE);
 
-    /// Out-of-line: `current_buffer` holds a `unique_ptr<ReadBufferFromFileBase>`
-    /// (incomplete here).
     ~ReaderExecutor();
 
     /// A contiguous run of bytes starting at the current position. `data` points
     /// into the executor's own block buffer and stays valid only until the next
-    /// `readNextChunk` / `seek` call. `size == 0` means EOF.
+    /// `readNextChunk` / `seek`. `size == 0` means EOF.
     struct Chunk
     {
         const char * data = nullptr;
@@ -47,11 +41,9 @@ public:
     };
 
     /// Read the next block (<= `block_size`, clamped to the current object's end
-    /// for known-size objects) starting at the current position, advancing the
-    /// position by the bytes read.
+    /// for known-size objects), advancing the position by the bytes read.
     Chunk readNextChunk();
 
-    /// Move the read position. The next `readNextChunk` reads from there.
     void seek(size_t new_position);
 
     size_t getPosition() const { return position; }
@@ -59,14 +51,13 @@ public:
     size_t totalSize() const { return offset_map.totalSize(); }
     bool hasUnknownSize() const { return offset_map.hasUnknownSize(); }
 
-    /// Logical object path for diagnostics (format/decompression errors via
-    /// `getFileNameFromReadBuffer`). The front object's `remote_path`; empty
-    /// when no objects are configured.
+    /// Front object's `remote_path`, used to name the source in diagnostics;
+    /// empty when no objects are configured.
     String getFileName() const { return log_file_path; }
 
 private:
-    /// EOF detection: size known -> `position >= totalSize()`; size unknown ->
-    /// the source's short return latched `reached_eof`. Seek-backward clears it.
+    /// At known size, EOF is `position >= totalSize`. At unknown size, a short
+    /// source read latches `reached_eof`; a backward `seek` clears it.
     bool atEnd() const
     {
         return reached_eof || (!offset_map.hasUnknownSize() && position >= totalSize());
@@ -79,7 +70,7 @@ private:
     size_t position = 0;
     bool reached_eof = false;
 
-    /// Destination for the bytes served by the latest `readNextChunk`.
+    /// Backs the bytes returned by the latest `readNextChunk`.
     Memory<> block;
 
     LoggerPtr log = getLogger("ReaderExecutor");

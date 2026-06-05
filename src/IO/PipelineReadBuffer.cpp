@@ -30,9 +30,8 @@ bool PipelineReadBuffer::nextImpl()
         return false;
     }
 
-    /// `chunk.data` is owned by the executor and valid until the next call. We
-    /// only expose it as the working buffer (the caller never writes through it),
-    /// so dropping const here is safe.
+    /// `chunk.data` is read-only and owned by the executor; we only expose it,
+    /// never write through it, so dropping const is safe.
     char * data = const_cast<char *>(chunk.data);
     internal_buffer = Buffer(data, data + chunk.size);
     working_buffer = internal_buffer;
@@ -67,8 +66,6 @@ off_t PipelineReadBuffer::seek(off_t off, int whence)
 
     LOG_DEBUG(log, "seek to {}", new_pos);
 
-    /// Drop the working buffer and delegate to the executor. The next `nextImpl`
-    /// reads a fresh chunk from `new_pos`.
     resetWorkingBuffer();
     executor->seek(new_pos);
     read_position = new_pos;

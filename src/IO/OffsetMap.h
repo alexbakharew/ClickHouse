@@ -25,11 +25,9 @@ public:
     /// A single logical range may span multiple objects.
     VectorWithMemoryTracking<PhysicalRange> map(ByteRange logical_range) const;
 
-    /// Find the object whose range contains `logical_offset`. Returns nullptr
-    /// if `logical_offset` is at or past `totalSize()`. The optional output
-    /// `object_file_offset` (the segment's `logical_offset`) lets callers
-    /// translate between object-local and file-level coordinates without
-    /// re-walking the segment list.
+    /// Find the object containing `logical_offset`, or nullptr if it is at or past
+    /// `totalSize`. When given, `object_file_offset` returns that object's start
+    /// offset in the logical file.
     const StoredObject * findObjectAt(size_t logical_offset, size_t * object_file_offset = nullptr) const;
 
     size_t totalSize() const { return total_size; }

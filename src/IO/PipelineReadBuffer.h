@@ -36,9 +36,8 @@ private:
     bool nextImpl() override;
 
     std::unique_ptr<ReaderExecutor> executor;
-    /// Logical offset just past the last byte exposed via `working_buffer`.
-    /// `getPosition()` subtracts `available()` to get the caller's current read
-    /// position.
+    /// Logical offset just past the last byte exposed via `working_buffer`;
+    /// `getPosition` subtracts `available` from it.
     size_t read_position = 0;
     LoggerPtr log = getLogger("PipelineReadBuffer");
 };

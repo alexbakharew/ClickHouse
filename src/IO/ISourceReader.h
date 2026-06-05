@@ -16,9 +16,7 @@ class ISourceReader
 public:
     virtual ~ISourceReader() = default;
 
-    /// Open a seekable buffer for reads from the object. `ReaderExecutor` drives
-    /// it with a plain copying `read()`, so the buffer manages its own memory
-    /// (normal, non-external mode) — every buffer kind works uniformly.
+    /// Open a seekable buffer over the object, positioned at its start.
     virtual std::unique_ptr<ReadBufferFromFileBase> open(const StoredObject & object) = 0;
 
     virtual String name() const = 0;

@@ -22,12 +22,8 @@ void OffsetMap::build(const StoredObjects & objects)
     {
         if (obj.bytes_size == StoredObject::UnknownSize)
         {
-            /// Unknown-size objects (S3 `HEAD` without `Content-Length`,
-            /// `stat()` failure on local disk) can only appear ALONE — we
-            /// can't compute logical offsets for objects that follow an
-            /// unknown-size one. In practice the only caller passing
-            /// `UnknownSize` is `StorageObjectStorageSource`, which always
-            /// reads single objects.
+            /// An unknown-size object must appear alone: logical offsets for
+            /// anything following it cannot be computed.
             if (objects.size() != 1)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "OffsetMap: unknown-size object is only supported in single-object pipelines (got {} objects)",
@@ -53,8 +49,7 @@ void OffsetMap::build(const StoredObjects & objects)
 
 const StoredObject * OffsetMap::findObjectAt(size_t logical_offset, size_t * object_file_offset) const
 {
-    /// Linear scan — `segments.size()` is bounded by the file's object
-    /// count, typically <= a handful even for gather-mode reads.
+    /// Linear scan: the segment count equals the file's object count, a handful at most.
     for (const auto & seg : segments)
     {
         if (seg.logical_offset <= logical_offset && logical_offset < seg.logical_offset + seg.size)

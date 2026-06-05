@@ -166,18 +166,14 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::build() const
     if (source->objects.empty())
         return std::make_unique<ReadBufferFromEmptyFile>();
 
-    /// Capture the query id once here (on the calling thread, which has the
-    /// query context). Subsequent cached-buffer creations happen lazily inside
-    /// gather/impl creators that may run on threadpool workers without query
-    /// context, so calling `CurrentThread::getQueryId()` there would return "".
-    /// Experimental `ReaderExecutor` path. When it returns a buffer it owns the
-    /// whole read (it must bypass the `wrap*` stages below — those wrap the
-    /// legacy matryoshka). Returns nullptr (fall back to the legacy path) when the
-    /// setting is off or the configuration is one the minimal executor can't
-    /// handle yet.
+    /// The executor owns the whole read, so it returns before the `wrap*` stages.
     if (auto pipeline_buf = tryBuildReaderExecutor())
         return pipeline_buf;
 
+    /// Capture the query id once here (on the calling thread, which has the
+    /// query context). Subsequent cached-buffer creations happen lazily inside
+    /// gather/impl creators that may run on threadpool workers without query
+    /// context, so calling `CurrentThread::getQueryId` there would return "".
     const std::string query_id(CurrentThread::getQueryId());
 
     auto impl = gather
@@ -197,9 +193,8 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::tryBuildReaderExecutor() c
     if (!settings.use_reader_executor)
         return nullptr;
 
-    /// The minimal executor handles neither caches, decryption, nor the
-    /// distributed cache yet. Fall back to the legacy path (never silently skip
-    /// a configured stage) when any of them is requested.
+    /// The executor does not implement caches, decryption, or the distributed
+    /// cache, so fall back rather than silently drop a configured stage.
     if (distributed_cache || memory_cache || !filesystem_caches.empty() || !decryption_stages.empty())
     {
         LOG_DEBUG(getLogger("ReadPipeline"),
@@ -208,9 +203,7 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::tryBuildReaderExecutor() c
         return nullptr;
     }
 
-    /// Only local files and object storage are wired into the executor so far.
-    /// The executor reads in blocks of the source's existing read-buffer size —
-    /// no dedicated executor block-size setting.
+    /// Only local files and object storage are supported; other sources fall back.
     std::shared_ptr<ISourceReader> source_reader;
     size_t block_size = 0;
     if (const auto * local_src = std::get_if<LocalFileSource>(&source->source))

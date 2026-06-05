@@ -177,8 +177,9 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
             else
                 options.PageSizeHint = settings.get()->list_object_keys_size;
 
-            for (auto blob_list_response = client_ptr->ListBlobs(options); blob_list_response.HasPage(); blob_list_response.MoveToNextPage())
+            while (true)
             {
+                auto blob_list_response = client_ptr->ListBlobs(options);
                 const auto & blobs_list = blob_list_response.Blobs;
 
                 for (const auto & blob : blobs_list)
@@ -198,6 +199,11 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
 
                 if (max_keys && children.size() >= max_keys)
                     break;
+
+                if (!blob_list_response.NextPageToken.HasValue() || blob_list_response.NextPageToken.Value().empty())
+                    break;
+
+                options.ContinuationToken = blob_list_response.NextPageToken;
             }
         });
 }
@@ -342,7 +348,16 @@ void AzureObjectStorage::removeObjectsBatchIfExists(
         for (const auto & object : object_batch)
             responses.push_back(client_ptr->addDeleteBlobToBatch(requests, object.remote_path));
 
-        client_ptr->SubmitBatch(requests);
+        try
+        {
+            client_ptr->SubmitBatch(requests);
+        }
+        catch (...)
+        {
+            for (const auto & object : object_batch)
+                add_log_entry(object, watch.elapsedMicroseconds() / object_batch.size(), -1, getCurrentExceptionMessage(false));
+            throw;
+        }
 
         client_ptr->traceAzureDeleteObjects(object_batch.size());
 

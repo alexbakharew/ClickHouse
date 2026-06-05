@@ -262,10 +262,11 @@ size_t ReadBufferFromAzureBlobStorage::readBigAt(char * to, size_t n, size_t ran
             {
                 auto download_response = blob_container_client->downloadRange(
                     path,
-                    /* range_offset */ range_begin,
-                    /* range_length */ n,
-                    attempt > 0 ? 1 : max_single_download_retries, log,
-                    blob_storage_log, container_for_logging);
+                    range_begin,
+                    n,
+                    1, log,
+                    blob_storage_log, container_for_logging,
+                    attempt);
 
                 setMetadataFromResponse(download_response.Value.Details, download_response.Value.BlobSize);
 

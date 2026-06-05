@@ -338,7 +338,8 @@ namespace
             auto exception = TSA_SUPPRESS_WARNING_FOR_READ(bg_exception);
             if (exception)
                 std::rethrow_exception(exception);
-const auto & tasks = TSA_SUPPRESS_WARNING_FOR_READ(bg_tasks);
+
+            const auto & tasks = TSA_SUPPRESS_WARNING_FOR_READ(bg_tasks);
             for (const auto & task : tasks)
                 block_ids.insert(block_ids.end(),task.block_ids.begin(), task.block_ids.end());
         }

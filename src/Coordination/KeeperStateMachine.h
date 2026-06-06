@@ -20,6 +20,7 @@ using KeeperResponseCallback = std::function<void(KeeperResponseForSession)>; //
 using SnapshotsQueue = ConcurrentBoundedQueue<CreateSnapshotTask>;
 
 struct KeeperStorageStats;
+class KeeperLogStore;
 
 struct ISnapshotLoader;
 
@@ -38,6 +39,9 @@ public:
 
     /// Read state from the latest snapshot
     virtual void init() = 0;
+
+    void setLogStore(KeeperLogStore * log_store_);
+    KeeperLogStore * getLogStore() { return log_store; }
 
     enum ZooKeeperLogSerializationVersion
     {
@@ -64,7 +68,7 @@ public:
 
     static nuraft::ptr<nuraft::buffer> getZooKeeperLogEntry(const KeeperRequestForSession & request_for_session);
 
-    virtual std::optional<KeeperDigest> preprocess(const KeeperRequestForSession & request_for_session) = 0;
+    virtual std::optional<KeeperDigest> preprocess(const KeeperRequestForSession & request_for_session, bool lock_mutex) = 0;
 
     void commit_config(const uint64_t log_idx, nuraft::ptr<nuraft::cluster_config> & new_conf) override; /// NOLINT
 
@@ -129,6 +133,10 @@ public:
     /// unlink and cross-disk moves until the transfer releases it.
     /// Caller must hold `snapshots_lock`.
     virtual SnapshotFileInfoPtr getSnapshotPinUnlocked(uint64_t log_idx) const TSA_REQUIRES(snapshots_lock) = 0;
+
+    /// Call after loading `storage` from snapshot.
+    /// Does preprocessRequest on log entries to populate storage's UncommittedState.
+    virtual void preprocessUncommittedLogEntries(uint64_t start_idx, uint64_t end_idx, nuraft::ptr<std::vector<nuraft::ptr<nuraft::log_entry>>> entries, bool lock_mutex) = 0;
 
 protected:
     CommitCallback commit_callback;
@@ -201,6 +209,8 @@ protected:
 
     KeeperSnapshotManagerS3 * snapshot_manager_s3;
 
+    KeeperLogStore * log_store = nullptr;
+
     virtual KeeperResponseForSession processReconfiguration(const KeeperRequestForSession & request_for_session)
         = 0;
 };
@@ -222,7 +232,7 @@ public:
     /// Read state from the latest snapshot
     void init() override;
 
-    std::optional<KeeperDigest> preprocess(const KeeperRequestForSession & request_for_session) override;
+    std::optional<KeeperDigest> preprocess(const KeeperRequestForSession & request_for_session, bool lock_mutex) override;
 
     nuraft::ptr<nuraft::buffer> pre_commit(uint64_t log_idx, nuraft::buffer & data) override;
 
@@ -289,6 +299,8 @@ public:
     void cancelIfHasUnfinishedSnapshotReceive() TSA_REQUIRES(snapshots_lock);
 
     SnapshotFileInfoPtr getSnapshotPinUnlocked(uint64_t log_idx) const override TSA_REQUIRES(snapshots_lock);
+
+    void preprocessUncommittedLogEntries(uint64_t start_idx, uint64_t end_idx, nuraft::ptr<std::vector<nuraft::ptr<nuraft::log_entry>>> entries, bool lock_mutex) override;
 
 private:
     /// Main state machine logic
